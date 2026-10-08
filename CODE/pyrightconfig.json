@@ -1,0 +1,9 @@
+{
+  "include": ["src", "pipeline", "analysis", "figures", "scripts"],
+  "extraPaths": ["src", "pipeline"],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "off",
+  "reportMissingImports": "none",
+  "reportArgumentType": "none",
+  "reportOptionalOperand": "none"
+}
