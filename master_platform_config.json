@@ -1,0 +1,20 @@
+{
+    "lang": "en",
+    "vina": "",
+    "obabel": "C:\\Users\\24216\\anaconda3\\Scripts\\obabel.EXE",
+    "meeko": "C:\\Users\\24216\\anaconda3\\Scripts\\mk_prepare_ligand.EXE",
+    "p2rank": "",
+    "wsl_env": "fpocket_env",
+    "root_dir": "E:\\AF3环境\\ALL-DATA",
+    "dock_rec": "",
+    "dock_lig": "",
+    "dock_out": "",
+    "strategy": "fpocket_rf",
+    "manual_box": "",
+    "preset": "Standard (exh=32, modes=20)",
+    "exh": 32,
+    "modes": 20,
+    "lambda": 0.75,
+    "max_pockets": 20,
+    "box_size": 25.0
+}

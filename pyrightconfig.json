@@ -1,0 +1,14 @@
+{
+  "include": ["."],
+  "extraPaths": [
+    "analysis",
+    "pipeline",
+    "src"
+  ],
+  "pythonVersion": "3.10",
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportAttributeAccessIssue": "none",
+  "reportCallIssue": "none",
+  "reportGeneralTypeIssues": "none"
+}

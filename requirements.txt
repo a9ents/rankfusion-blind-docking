@@ -1,0 +1,44 @@
+# ============================================================
+# RankFusion for Blind Docking — Python dependencies
+# ============================================================
+# Install: pip install -r requirements.txt
+# Note: external tools vina / obabel / fpocket / USalign
+#       must be installed separately.
+# ============================================================
+
+# --- Numerics and statistics ---
+numpy>=1.24
+scipy>=1.10
+
+# --- Data handling ---
+pandas>=2.0
+
+# --- Clustering (DBSCAN in auto_pipeline.py) ---
+scikit-learn>=1.3
+
+# --- Plotting ---
+matplotlib>=3.7
+seaborn>=0.12
+
+# --- Structure parsing ---
+gemmi>=0.6
+
+# --- Cheminformatics ---
+rdkit>=2023.9
+meeko>=0.5
+
+# --- Statistical tests (McNemar) ---
+statsmodels>=0.14
+
+# --- PDB release-date lookup (supplementary_stats.py) ---
+requests>=2.31
+
+# --- Advanced Physical Interventions (OpenMM & DLPacker) ---
+# Note: For best performance and GPU support, it is highly recommended 
+# to install openmm and pdbfixer via conda:
+# conda install -c conda-forge openmm pdbfixer
+openmm>=8.0
+pdbfixer>=1.9
+# DLPacker usually requires specific PyTorch environments; if pip installation fails, 
+# please refer to https://github.com/nekitmal/DLPacker for building from source.
+# dlpacker

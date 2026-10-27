@@ -1,0 +1,17 @@
+comparison,mean_diff,ci_low,ci_high,n_boot,significant
+af3top1_rankfusion vs exp_top1,4.183,2.181,6.159,10000,yes
+af3top1_rankfusion vs exp_energy,6.278,4.328,8.234,10000,yes
+af3top1_rankfusion vs exp_rankfusion,7.008,5.037,8.949,10000,yes
+af3top1_rankfusion vs af3ligand,-31.622,-36.544,-27.105,10000,yes
+af3top1_rankfusion vs af3oracle_rankfusion,-2.261,-4.072,-0.431,10000,yes
+exp_rankfusion vs exp_top1,-2.83,-4.346,-1.344,10000,yes
+exp_rankfusion vs exp_energy,-0.455,-1.399,0.514,10000,no
+exp_rankfusion vs p2rank_top1,0.206,-1.569,1.976,10000,no
+exp_top1 vs p2rank_top1,3.062,1.131,4.965,10000,yes
+exp_rankfusion vs af3ligand,-39.086,-43.659,-34.975,10000,yes
+p2rank_top1 vs p2rank_rf,1.717,0.27,3.165,10000,yes
+p2rank_rf vs p2rank_top1,-1.717,-3.165,-0.27,10000,yes
+p2rank_top1 vs p2rank_energy,0.93,-0.686,2.563,10000,no
+p2rank_energy vs p2rank_rf,0.787,-0.161,1.791,10000,no
+exp_rankfusion vs p2rank_rf,1.923,0.324,3.577,10000,yes
+exp_rankfusion vs p2rank_energy,1.136,-0.384,2.64,10000,no
