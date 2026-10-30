@@ -1,738 +1,1150 @@
 #!/usr/bin/env python3
 """
-docking_software.py — 大分子-小分子盲对接软件（完整版）
+auto_pipeline.py — 全自动对接流程
+  - 单盒模式 (single)：bbox + max_size 截断
+  - 网格模式 (grid)：切网格 + 过滤空盒子
+  - ★ 口袋引导模式 (pocket_guided)：fpocket + Rank Fusion 选盒子
+  - 系综对接、共识盒子、共识打分可选
+  - 自动遍历大分子目录
 
-流程：
-  1. 选择大分子文件夹（*.pdb）
-  2. 选择小分子父文件夹（每个 case 一个子目录）
-  3. 选择 Box 策略：
-       - fpocket + Rank Fusion（默认，需 WSL + fpocket）
-       - P2Rank + Rank Fusion（需 P2Rank）
-       - 手动指定 box（所有 case 共用一个 .box）
-       - 盲对接（整蛋白 bbox）
-  4. 选择对接精度：快速 / 标准 / 深度 / 自定义
-  5. 一键运行，实时进度 + 日志
-
-所有路径自适应：环境变量 → 项目 tools/ → PATH
-任何电脑拷贝整个文件夹即可运行，无需改代码。
-
-CLI 模式:
-  python docking_software.py --cli \\
-      --receptor_dir exp_structures --ligand_parent ligands \\
-      --out_dir results --strategy fpocket_rf
+依赖：vina, obabel, meeko
+      pocket_guided 模式需要：WSL + fpocket (conda install -c conda-forge fpocket)
 """
 import os
 import sys
+import csv
+import json          # >>> AF3 DUMP 需要
 import shutil
-import threading
-import traceback
+import subprocess
+import tempfile
+import multiprocessing
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import numpy as np
+from sklearn.cluster import DBSCAN
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # =====================================================================
-# 路径自适应导入
+# 工具探测
 # =====================================================================
-_ROOT = Path(__file__).resolve().parent
-for _sub in ("pipeline", "src", "analysis"):
-    _p = str(_ROOT / _sub)
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
-import auto_pipeline as ap                    # noqa: E402
-import run_p2rank_rankfusion as prf           # noqa: E402
-import run_p2rank_baseline as prb             # noqa: E402
-
-
-# =====================================================================
-# 全局常量
-# =====================================================================
-BOX_STRATEGIES = [
-    ("fpocket_rf", "fpocket + Rank Fusion（推荐）"),
-    ("p2rank_rf",  "P2Rank + Rank Fusion"),
-    ("manual",     "手动指定 box"),
-    ("blind",      "盲对接（整蛋白 bbox）"),
-]
-
-PRESETS = {
-    "fast":     {"exh": 8,  "modes": 5,  "label": "快速（exh=8, modes=5）"},
-    "standard": {"exh": 32, "modes": 20, "label": "标准（exh=32, modes=20）"},
-    "deep":     {"exh": 64, "modes": 40, "label": "深度（exh=64, modes=40）"},
-    "custom":   {"exh": 32, "modes": 20, "label": "自定义"},
-}
-
-WORK_ROOT = _ROOT / "work"
-
-
-# =====================================================================
-# 工具路径解析（统一入口）
-# =====================================================================
-def resolve_vina():
-    """Vina 路径：环境变量 → PATH → tools/vina/vina.exe"""
-    v = os.environ.get("VINA_BIN")
-    if v and Path(v).is_file():
-        return v
-    p = ap._which("vina")
+def _which(name):
+    p = shutil.which(name)
     if p:
         return p
-    cand = _ROOT / "tools" / "vina" / "vina.exe"
-    return str(cand) if cand.is_file() else None
-
-
-def resolve_p2rank_dir():
-    """P2Rank 安装目录：环境变量 → tools/p2rank_2.6-alpha"""
-    v = os.environ.get("P2RANK_DIR")
-    if v and (Path(v) / "bin" / "p2rank.jar").is_file():
-        return Path(v)
-    cand = _ROOT / "tools" / "p2rank_2.6-alpha"
-    if (cand / "bin" / "p2rank.jar").is_file():
-        return cand
+    for ext in ("", ".exe", ".bat", ".cmd", ".py"):
+        cand = os.path.join(SCRIPT_DIR, name + ext)
+        if os.path.isfile(cand):
+            return cand
+    py_dir = os.path.dirname(sys.executable)
+    for sd in (os.path.join(py_dir, "Scripts"), py_dir):
+        for ext in ("", ".exe", ".bat", ".cmd", ".py"):
+            cand = os.path.join(sd, name + ext)
+            if os.path.isfile(cand):
+                return cand
     return None
 
 
-# =====================================================================
-# 环境自检
-# =====================================================================
-def check_environment(log):
-    """返回 True 表示必需工具齐全。"""
-    ok = True
+VINA_BIN = _which("vina") or r"E:\tools\vina\vina.exe"
+OBABEL_BIN = _which("obabel")
+MEEKO_BIN = _which("mk_prepare_ligand")
 
-    vina = resolve_vina()
-    if vina:
-        log(f"  ✓ vina: {vina}")
-    else:
-        log("  ✗ vina 未找到（必需）→ 放到 tools/vina/ 或加到 PATH")
-        ok = False
+_VINA_GPU_MANUAL = r"E:\AUTO\Vina-GPU-2.1-main (1)\Vina-GPU-2.1-main\AutoDock-Vina-GPU-2.1\Vina-GPU+.exe"
+VINA_GPU_BIN = None
+if _VINA_GPU_MANUAL and os.path.isfile(_VINA_GPU_MANUAL):
+    VINA_GPU_BIN = _VINA_GPU_MANUAL
+else:
+    VINA_GPU_BIN = (_which("AutoDock-Vina-GPU-2-1") or _which("Vina-GPU+"))
 
-    obabel = ap._which("obabel")
-    if obabel:
-        log(f"  ✓ obabel: {obabel}")
-    else:
-        log("  ✗ obabel 未找到（必需）→ 加到 PATH")
-        ok = False
+_TOOL_CACHE = {}
 
-    meeko = ap._which("mk_prepare_ligand")
-    if meeko:
-        log(f"  ✓ mk_prepare_ligand: {meeko}")
-    else:
-        log("  · mk_prepare_ligand 未找到（可选，回退 obabel）")
 
-    p2rank = resolve_p2rank_dir()
-    if p2rank:
-        log(f"  ✓ P2Rank: {p2rank}")
-    else:
-        log("  · P2Rank 未找到（仅 p2rank_rf 策略需要）")
-
+def tool_available(name):
+    if name in _TOOL_CACHE:
+        return _TOOL_CACHE[name]
+    ok = (shutil.which(name) is not None) or os.path.isfile(name)
+    _TOOL_CACHE[name] = ok
     return ok
 
 
 # =====================================================================
-# 单 case 处理
+# 配置
 # =====================================================================
-def process_one_case(case, receptor_pdb, ligand_dir, out_root,
-                     strategy, cfg, log):
-    case_out = Path(out_root) / case
-    case_out.mkdir(parents=True, exist_ok=True)
+CFG = {
+    "receptor_dir": "",
+    "ligand_parent": "",
 
-    log(f"\n[{case}] 大分子: {receptor_pdb.name}")
-    log(f"[{case}] 小分子: {ligand_dir}")
+    # GPU
+    "use_gpu": False,
+    "vina_gpu_kernel_dir": "",
+    "gpu_thread": 2000,
+    "gpu_max_box_size": 25.0,
+    "gpu_fallback_cpu": True,
 
-    # ---- 受体 pdbqt ----
-    rec_pdbqt = case_out / "receptor.pdbqt"
-    if not rec_pdbqt.is_file() or rec_pdbqt.stat().st_size < 100:
-        log(f"[{case}]   → 转换受体 pdbqt")
-        if not ap.pdb_to_pdbqt_receptor(str(receptor_pdb), str(rec_pdbqt)):
-            log(f"[{case}]   ✗ 受体转换失败")
-            return False
+    # ★ 盲对接模式：single | grid | pocket_guided
+    "blind_mode": "pocket_guided",
 
-    # ---- 收集配体 ----
-    ligs = sorted([
-        p for p in Path(ligand_dir).iterdir()
-        if p.suffix.lower() in (".pdb", ".sdf", ".mol", ".mol2", ".pdbqt")
-        and p.is_file()
-    ])
-    if not ligs:
-        log(f"[{case}]   ✗ 配体目录无有效文件")
+    # 单盒模式
+    "n_seeds": 3,
+    "exhaustiveness_blind": 64,
+    "num_modes_blind": 50,
+    "blind_padding": 8.0,
+    "blind_max_size": 25.0,
+
+    # 网格模式
+    "grid_box_size": 40.0,
+    "grid_step": 30.0,
+    "grid_probe_ligands": 1,
+    "grid_coarse_exh": 4,
+    "grid_coarse_seed_count": 1,
+    "grid_coarse_num_modes": 5,
+    "grid_top_sites": 8,
+    "grid_min_gap": 12.0,
+    "grid_min_box_atoms": 20,
+    "grid_cpus": max(1, multiprocessing.cpu_count()),
+
+    # ★ 口袋引导模式（Rank Fusion）
+    "pg_wsl_env": "fpocket_env",       # WSL conda 环境名
+    "pg_min_volume": 100.0,             # 口袋最小体积 Å³
+    "pg_max_pockets": 20,               # 最多取多少个口袋
+    "pg_quick_exh": 4,                  # 快速对接的 exhaustiveness
+    "pg_quick_modes": 3,                # 快速对接输出 pose 数
+    "pg_rank_lambda": 0.5,              # Rank Fusion λ（0=纯energy，大=偏score）
+    "pg_box_size": 25.0,                # 精修盒子边长
+
+    # 精对接
+    "exhaustiveness_fine": 32,
+    "num_modes_fine": 20,
+
+    # 聚类
+    "eps": 5.0,
+    "min_samples": 3,
+    "min_ratio": 0.4,
+    "box_size": 25.0,
+
+    # 开关
+    "run_fine": True,
+    "export_csv": True,
+    "analyze_scope": "all",
+    "top_n": 10,
+
+    # 系综
+    "ensemble_mode": False,
+    "n_conformers": 5,
+    "md_traj_dir": "",
+    "ensemble_consensus_min": 2,
+
+    # 共识盒子
+    "consensus_box": False,             # pocket_guided 模式下不需要
+    "box_pose_weight": 0.5,
+    "fpocket_bin": "fpocket",
+    "p2rank_bin": "prank",
+    "box_n_pockets": 3,
+    "enable_fpocket": False,
+    "enable_p2rank": False,
+
+    # 共识打分
+    "consensus_scoring": False,
+    "smina_bin": "smina",
+    "gnina_bin": "gnina",
+    "enable_smina": False,
+    "enable_gnina": False,
+    "score_weights": {"vina": 0.3, "smina": 0.2, "gnina": 0.5},
+
+    "ligand_ext": ".pdb",
+}
+
+
+# =====================================================================
+# PDB → PDBQT (包含自动清洗与自愈)
+# =====================================================================
+def _clean_pdbqt_headers(pdbqt_path):
+    """自动清洗 PDBQT，受体只保留必要的原子/骨架标签"""
+    if not os.path.isfile(pdbqt_path):
+        return False
+    try:
+        with open(pdbqt_path, errors="ignore") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+        
+    # 白名单：受体只保留这些，彻底屏蔽 Vina 不认识的标签（如 SOURCE, CAVEAT 等）
+    allow_prefixes = ("ATOM", "HETATM", "TER")
+    out = [l for l in lines if l.startswith(allow_prefixes)]
+    
+    with open(pdbqt_path, "w") as f:
+        f.writelines(out)
+    return True
+
+
+def pdb_to_pdbqt_receptor(pdb_path, pdbqt_path):
+    if not OBABEL_BIN:
+        raise RuntimeError("未找到 obabel")
+    cmd = [OBABEL_BIN, pdb_path, "-O", pdbqt_path, "-xr", "-h", "--delete", "HOH"]
+    subprocess.run(cmd, capture_output=True, text=True)
+    if os.path.isfile(pdbqt_path) and os.path.getsize(pdbqt_path) > 100:
+        _clean_pdbqt_headers(pdbqt_path)
+    return os.path.isfile(pdbqt_path) and os.path.getsize(pdbqt_path) > 100
+
+
+def ensure_valid_receptor_pdbqt(receptor_pdb, rec_pdbqt):
+    """确保受体 PDBQT 存在、干净且合法，否则自动重建"""
+    # 1. 文件不存在或太小，直接重新生成
+    if not os.path.isfile(rec_pdbqt) or os.path.getsize(rec_pdbqt) < 100:
+        return pdb_to_pdbqt_receptor(receptor_pdb, rec_pdbqt)
+        
+    # 2. 文件存在，检查头部是否有脏数据（比如旧版本生成的 SOURCE, CAVEAT）
+    has_dirty = False
+    try:
+        with open(rec_pdbqt, "r", errors="ignore") as f:
+            for _ in range(50):  # 检查前50行
+                line = f.readline()
+                if not line: break
+                if line.startswith(("SOURCE", "CAVEAT", "REMARK", "HEADER", "TITLE")):
+                    has_dirty = True
+                    break
+    except Exception:
+        has_dirty = True
+        
+    # 3. 发现有脏数据，立刻就地自动清洗
+    if has_dirty:
+        print(f"    ⚠ 检测到旧受体缓存含有非法标签，正在自动清洗...")
+        _clean_pdbqt_headers(rec_pdbqt)
+        
+        # 再次检查清洗后的文件大小
+        if os.path.getsize(rec_pdbqt) < 100:
+            print(f"    ⚠ 自动清洗失败（文件为空），将从 PDB 重新生成...")
+            os.remove(rec_pdbqt)
+            return pdb_to_pdbqt_receptor(receptor_pdb, rec_pdbqt)
+            
+    return True
+
+
+def pdb_to_pdbqt_ligand(pdb_path, pdbqt_path):
+    """优先用 Meeko（从SDF），失败则回退 obabel"""
+    if MEEKO_BIN:
+        sdf_candidate = Path(pdb_path).with_suffix(".sdf")
+        if sdf_candidate.is_file():
+            r = subprocess.run([MEEKO_BIN, "-i", str(sdf_candidate),
+                                "-o", pdbqt_path],
+                               capture_output=True, text=True, timeout=120)
+            if (os.path.isfile(pdbqt_path)
+                    and os.path.getsize(pdbqt_path) > 100):
+                return True
+
+    if not OBABEL_BIN:
+        return False
+    cmd = [OBABEL_BIN, os.path.abspath(pdb_path),
+           "-O", os.path.abspath(pdbqt_path), "-h"]
+    subprocess.run(cmd, capture_output=True, text=True)
+    if not (os.path.isfile(pdbqt_path) and os.path.getsize(pdbqt_path) > 100):
+        return False
+    _clean_pdbqt_headers(pdbqt_path)
+    return os.path.isfile(pdbqt_path) and os.path.getsize(pdbqt_path) > 100
+
+
+# =====================================================================
+# 盒子计算
+# =====================================================================
+def compute_bounding_box(pdbqt_path, padding, max_size=60.0):
+    xs, ys, zs = [], [], []
+    with open(pdbqt_path) as f:
+        for line in f:
+            if line.startswith(("ATOM", "HETATM")):
+                try:
+                    xs.append(float(line[30:38]))
+                    ys.append(float(line[38:46]))
+                    zs.append(float(line[46:54]))
+                except ValueError:
+                    continue
+    if not xs:
+        return None, None
+    cx = (max(xs) + min(xs)) / 2
+    cy = (max(ys) + min(ys)) / 2
+    cz = (max(zs) + min(zs)) / 2
+    sx = min(max(max(xs) - min(xs) + padding, 20.0), max_size)
+    sy = min(max(max(ys) - min(ys) + padding, 20.0), max_size)
+    sz = min(max(max(zs) - min(zs) + padding, 20.0), max_size)
+    return (cx, cy, cz), (sx, sy, sz)
+
+
+def read_box_file(box_path):
+    with open(box_path) as f:
+        parts = f.read().split()
+    return tuple(map(float, parts[:3])), tuple(map(float, parts[3:6]))
+
+
+# =====================================================================
+# Vina 调用
+# =====================================================================
+def run_vina(receptor_pdbqt, ligand_pdbqt, out_pdbqt, center, size,
+             exhaustiveness, num_modes, seed):
+    if not VINA_BIN:
+        raise RuntimeError("未找到 vina")
+    cmd = [
+        VINA_BIN,
+        "--receptor", receptor_pdbqt,
+        "--ligand", ligand_pdbqt,
+        "--out", out_pdbqt,
+        "--center_x", f"{center[0]:.3f}",
+        "--center_y", f"{center[1]:.3f}",
+        "--center_z", f"{center[2]:.3f}",
+        "--size_x", f"{size[0]:.3f}",
+        "--size_y", f"{size[1]:.3f}",
+        "--size_z", f"{size[2]:.3f}",
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes", str(num_modes),
+        "--seed", str(seed),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    except subprocess.TimeoutExpired:
+        return False
+    if r.returncode != 0 or not os.path.isfile(out_pdbqt):
+        return False
+    return True
+
+
+# =====================================================================
+# Pose 解析
+# =====================================================================
+def parse_poses(pdbqt_path):
+    poses, atoms, energy = [], [], None
+    try:
+        with open(pdbqt_path) as f:
+            for line in f:
+                if line.startswith("MODEL"):
+                    if atoms:
+                        poses.append({"energy": energy, "atoms": atoms})
+                    atoms, energy = [], None
+                elif line.startswith("ENDMDL"):
+                    if atoms:
+                        poses.append({"energy": energy, "atoms": atoms})
+                    atoms, energy = [], None
+                elif line.startswith("REMARK VINA RESULT:"):
+                    try:
+                        energy = float(line.split()[3])
+                    except (IndexError, ValueError):
+                        energy = None
+                elif line.startswith(("ATOM", "HETATM")):
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        elem = line[76:78].strip() if len(line) > 76 else ""
+                        if elem != "H":
+                            atoms.append((x, y, z))
+                    except ValueError:
+                        continue
+        if atoms:
+            poses.append({"energy": energy, "atoms": atoms})
+    except OSError:
+        pass
+    return poses
+
+
+def read_best_energy(pdbqt_path):
+    best = None
+    try:
+        with open(pdbqt_path) as f:
+            for line in f:
+                if line.startswith("REMARK VINA RESULT:"):
+                    try:
+                        e = float(line.split()[3])
+                        if best is None or e < best:
+                            best = e
+                    except (IndexError, ValueError):
+                        pass
+    except OSError:
+        pass
+    return best
+
+
+def centroid(atoms):
+    if not atoms:
+        return None
+    return (sum(a[0] for a in atoms) / len(atoms),
+            sum(a[1] for a in atoms) / len(atoms),
+            sum(a[2] for a in atoms) / len(atoms))
+
+
+def pdb_centroid(pdb_path):
+    xs, ys, zs = [], [], []
+    try:
+        with open(pdb_path) as f:
+            for line in f:
+                if line.startswith(("ATOM", "HETATM")):
+                    try:
+                        xs.append(float(line[30:38]))
+                        ys.append(float(line[38:46]))
+                        zs.append(float(line[46:54]))
+                    except ValueError:
+                        continue
+    except OSError:
+        return None
+    if not xs:
+        return None
+    return (sum(xs) / len(xs), sum(ys) / len(ys), sum(zs) / len(zs))
+
+
+def load_all_poses(root, conformer=None):
+    all_poses = []
+    for fp in sorted(Path(root).rglob("docking_*.pdbqt")):
+        for p in parse_poses(str(fp)):
+            c = centroid(p["atoms"])
+            if c:
+                item = {"file": fp.parent.name + "/" + fp.name,
+                        "energy": p["energy"], "center": c}
+                if conformer is not None:
+                    item["conformer"] = conformer
+                all_poses.append(item)
+    return all_poses
+
+
+def cluster_poses(all_poses, eps, min_samples):
+    if not all_poses:
+        return [], None
+    X = np.array([p["center"] for p in all_poses])
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(X)
+    clusters = []
+    for lab in sorted(set(labels)):
+        if lab == -1:
+            continue
+        idx = [i for i, l in enumerate(labels) if l == lab]
+        pts = X[idx]
+        energies = [all_poses[i]["energy"] for i in idx
+                    if all_poses[i]["energy"] is not None]
+        clusters.append({
+            "label": int(lab), "size": len(idx),
+            "center": pts.mean(axis=0),
+            "span": pts.max(axis=0) - pts.min(axis=0),
+            "min_energy": min(energies) if energies else None,
+            "mean_energy": sum(energies) / len(energies) if energies else None,
+        })
+    clusters.sort(key=lambda c: (
+        -c["size"],
+        c["mean_energy"] if c["mean_energy"] is not None else 0))
+    return clusters, labels
+
+
+def annotate_cluster_conformers(clusters, all_poses, labels):
+    if labels is None:
+        return clusters
+    for c in clusters:
+        idx = [i for i, l in enumerate(labels) if l == c["label"]]
+        confs = [all_poses[i].get("conformer", "crystal") for i in idx]
+        dist = {}
+        for k in confs:
+            dist[k] = dist.get(k, 0) + 1
+        c["conformer_dist"] = dist
+        c["n_conformers"] = len(dist)
+    return clusters
+
+
+def judge_quality(clusters, n_total, min_ratio):
+    if not clusters or n_total == 0:
+        return False, "无聚类"
+    top_ratio = clusters[0]["size"] / n_total
+    msgs = []
+    if top_ratio < min_ratio:
+        msgs.append(f"top1 {top_ratio:.1%} < {min_ratio:.0%}")
+    return (False, "; ".join(msgs)) if msgs else (True, f"top1 {top_ratio:.1%}")
+
+
+def judge_ensemble_consensus(clusters, min_confs):
+    if not clusters:
+        return False, "无聚类"
+    top = clusters[0]
+    n = top.get("n_conformers", 1)
+    dist = top.get("conformer_dist", {})
+    detail = ", ".join(f"{k}×{v}" for k, v in dist.items())
+    return (n >= min_confs), f"top1 覆盖 {n} 构象 ({detail})"
+
+
+def prepare_ensembles(receptor_pdb, lig_dir):
+    if not CFG["ensemble_mode"]:
+        return [("crystal", receptor_pdb)]
+    md_dir = CFG["md_traj_dir"]
+    if not os.path.isdir(md_dir):
+        return [("crystal", receptor_pdb)]
+    reps = sorted(Path(md_dir).glob("representative_*.pdb"))
+    if not reps:
+        reps = sorted(Path(md_dir).glob("*.pdb"))
+    if not reps:
+        return [("crystal", receptor_pdb)]
+    n = CFG["n_conformers"]
+    pairs = [(f"conf{i}", str(p)) for i, p in enumerate(reps[:n], 1)]
+    pairs.append(("crystal", receptor_pdb))
+    return pairs
+
+
+# =====================================================================
+# ★ 口袋引导模式（Rank Fusion）
+# =====================================================================
+def _wsl_path(p):
+    """Windows 路径 → WSL 路径"""
+    p = str(Path(p).resolve()).replace("\\", "/")
+    if len(p) >= 2 and p[1] == ":":
+        p = f"/mnt/{p[0].lower()}{p[2:]}"
+    return p
+
+
+def run_fpocket_wsl(receptor_pdb, out_dir):
+    """Linux 原生调用 fpocket（函数名保留兼容，实际不用 WSL）"""
+    import platform
+    if platform.system() == "Windows":
+        # Windows 走 WSL
+        p = str(Path(receptor_pdb).resolve()).replace("\\", "/")
+        if len(p) >= 2 and p[1] == ":":
+            p = f"/mnt/{p[0].lower()}{p[2:]}"
+        rec_wsl = p
+        out_wsl = _wsl_path(out_dir)
+        env = CFG["pg_wsl_env"]
+        cmd = ["wsl", "-e", "bash", "-c",
+               f"source $HOME/miniconda3/bin/activate {env} && "
+               f"mkdir -p '{out_wsl}' && cd '{out_wsl}' && "
+               f"fpocket -f '{rec_wsl}'"]
+    else:
+        # Linux 原生
+        os.makedirs(out_dir, exist_ok=True)
+        cmd = ["bash", "-c",
+               f"cd '{out_dir}' && fpocket -f '{receptor_pdb}'"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=300, encoding="utf-8", errors="replace")
+        return r.returncode == 0
+    except subprocess.TimeoutExpired:
         return False
 
-    lig_work = case_out / "ligands_pdbqt"
-    lig_work.mkdir(exist_ok=True)
+
+def parse_fpocket_info(info_path):
+    """解析 receptor_info.txt，返回 {pocket_id: {score, volume}}"""
+    info = {}
+    current = None
+    with open(info_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("Pocket") and line.endswith(":"):
+                current = line.split()[1]
+                info[f"pocket{current}"] = {"score": 0.0, "volume": 0.0}
+            elif current:
+                if line.startswith("Druggability Score"):
+                    try:
+                        info[f"pocket{current}"]["score"] = float(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+                elif line.startswith("Volume :"):
+                    try:
+                        info[f"pocket{current}"]["volume"] = float(line.split(":")[-1].strip())
+                    except ValueError:
+                        pass
+    return info
+
+
+def load_fpocket_pockets(case_dir, min_volume=100.0, max_pockets=20):
+    """加载 fpocket 结果，返回口袋列表"""
+    out_dir = case_dir / "receptor_out"
+    info_path = out_dir / "receptor_info.txt"
+    pocket_dir = out_dir / "pockets"
+    if not info_path.is_file() or not pocket_dir.is_dir():
+        return []
+
+    meta = parse_fpocket_info(info_path)
+    pockets = []
+    for atm in sorted(pocket_dir.glob("pocket*_atm.pdb"),
+                      key=lambda p: int(p.stem.split("_")[0].replace("pocket", ""))):
+        key = atm.stem.split("_")[0]
+        if key not in meta:
+            continue
+        vol = meta[key]["volume"]
+        if vol < min_volume:
+            continue
+        xs, ys, zs = [], [], []
+        with open(atm) as f:
+            for line in f:
+                if line.startswith(("ATOM", "HETATM")):
+                    try:
+                        xs.append(float(line[30:38]))
+                        ys.append(float(line[38:46]))
+                        zs.append(float(line[46:54]))
+                    except ValueError:
+                        continue
+        if not xs:
+            continue
+        c = (float(np.mean(xs)), float(np.mean(ys)), float(np.mean(zs)))
+        pockets.append({
+            "pocket": key,
+            "center": c,
+            "score": meta[key]["score"],
+            "volume": vol,
+        })
+    # 按 druggability 排序，取前 N 个
+    pockets.sort(key=lambda p: p["score"], reverse=True)
+    return pockets[:max_pockets]
+
+
+def _dock_one_pocket(args):
+    """单个口袋快速对接，返回 (pocket_key, energy, err_msg)"""
+    (rec_pdbqt, lig_pdbqt, center, out_path, pocket_key) = args
+    box_size = CFG["pg_box_size"]
+    cmd = [
+        VINA_BIN,
+        "--receptor", rec_pdbqt,
+        "--ligand", lig_pdbqt,
+        "--out", out_path,
+        "--center_x", f"{center[0]:.3f}",
+        "--center_y", f"{center[1]:.3f}",
+        "--center_z", f"{center[2]:.3f}",
+        "--size_x", f"{box_size}",
+        "--size_y", f"{box_size}",
+        "--size_z", f"{box_size}",
+        "--exhaustiveness", str(CFG["pg_quick_exh"]),
+        "--num_modes", str(CFG["pg_quick_modes"]),
+        "--seed", "42",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                           encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        return (pocket_key, None, "timeout")
+    except Exception as ex:
+        return (pocket_key, None, f"运行异常: {ex}")
+
+    if r.returncode != 0:
+        return (pocket_key, None, f"Vina返回错误码 {r.returncode}, stderr: {r.stderr[:500]}")
+        
+    e = read_best_energy(out_path)
+    if e is None:
+        return (pocket_key, None, f"没有解析到能量, stderr: {r.stderr[:500]}")
+        
+    return (pocket_key, e, "")  # 成功，错误信息为空
+
+
+def run_pocket_guided(receptor_pdb, ligand_dir, out_dir):
+    """
+    ★ 口袋引导对接：
+    1. fpocket 找口袋
+    2. 每个口袋快速对接
+    3. Rank Fusion 选最佳口袋
+    4. 在最佳盒子里精修
+    """
+    work = os.path.join(out_dir, "work")
+    os.makedirs(work, exist_ok=True)
+
+    # 1. 受体准备（包含自动清洗与自愈）
+    rec_pdbqt = os.path.join(work, "receptor.pdbqt")
+    if not ensure_valid_receptor_pdbqt(receptor_pdb, rec_pdbqt):
+        print("    ❌ 受体转换失败")
+        return False, []
+
+    # 2. fpocket
+    print(f"    ▶ fpocket 找口袋...")
+    fpocket_out = os.path.join(work, "fpocket")
+    os.makedirs(fpocket_out, exist_ok=True)
+    # fpocket 输出到输入文件所在目录，所以先复制受体 pdb
+    rec_local = os.path.join(fpocket_out, "receptor.pdb")
+    if not os.path.isfile(rec_local):
+        shutil.copy(receptor_pdb, rec_local)
+    ok = run_fpocket_wsl(rec_local, fpocket_out)
+    if not ok:
+        print("    ⚠ fpocket 失败，回退 grid 模式")
+        return False, []
+
+    case_dir = Path(fpocket_out)
+    pockets = load_fpocket_pockets(case_dir, CFG["pg_min_volume"], CFG["pg_max_pockets"])
+    if not pockets:
+        print("    ⚠ fpocket 无有效口袋")
+        return False, []
+    print(f"    ✓ fpocket 找到 {len(pockets)} 个口袋")
+
+    # 3. 配体准备
+    ligs = sorted(Path(ligand_dir).glob(f"*{CFG['ligand_ext']}"))
+    if not ligs:
+        print("    ⚠ 无配体")
+        return False, []
+
+    lig_work = os.path.join(work, "ligands")
+    os.makedirs(lig_work, exist_ok=True)
     lig_pdbqts = []
     for lig in ligs:
-        out_pqt = lig_work / f"{lig.stem}.pdbqt"
-        if not out_pqt.is_file() or out_pqt.stat().st_size < 100:
-            if not ap.pdb_to_pdbqt_ligand(str(lig), str(out_pqt)):
+        out_pdbqt = os.path.join(lig_work, f"{lig.stem}.pdbqt")
+        if not os.path.isfile(out_pdbqt) or os.path.getsize(out_pdbqt) < 100:
+            if not pdb_to_pdbqt_ligand(str(lig), out_pdbqt):
                 continue
-        lig_pdbqts.append(out_pqt)
+        lig_pdbqts.append(out_pdbqt)
+
     if not lig_pdbqts:
-        log(f"[{case}]   ✗ 无配体成功转 pdbqt")
-        return False
-    log(f"[{case}]   → {len(lig_pdbqts)} 个配体就绪")
+        print("    ⚠ 无有效配体")
+        return False, []
+    print(f"    配体: {len(lig_pdbqts)}")
 
-    # ---- 按策略生成 box ----
-    box_file = case_out / "receptor.box"
-    final_center = None
-    final_size = None
-
-    if strategy == "blind":
-        log(f"[{case}]   → 盲对接 bbox")
-        center, size = ap.compute_bounding_box(
-            str(rec_pdbqt), ap.CFG["blind_padding"],
-            ap.CFG["blind_max_size"])
-        if center is None:
-            log(f"[{case}]   ✗ bbox 计算失败")
-            return False
-        final_center = center
-        final_size = size
-        with open(box_file, "w") as f:
-            f.write(f"{center[0]:.3f} {center[1]:.3f} {center[2]:.3f} "
-                    f"{size[0]:.3f} {size[1]:.3f} {size[2]:.3f}\n")
-
-    elif strategy == "manual":
-        manual_src = cfg.get("manual_box")
-        if not manual_src or not Path(manual_src).is_file():
-            log(f"[{case}]   ✗ 手动 box 未指定")
-            return False
-        with open(manual_src) as f:
-            parts = f.read().split()
-        final_center = tuple(map(float, parts[:3]))
-        final_size = tuple(map(float, parts[3:6]))
-        with open(box_file, "w") as f:
-            f.write(f"{final_center[0]:.3f} {final_center[1]:.3f} "
-                    f"{final_center[2]:.3f} {final_size[0]:.3f} "
-                    f"{final_size[1]:.3f} {final_size[2]:.3f}\n")
-        log(f"[{case}]   → 使用手动 box")
-
-    elif strategy == "fpocket_rf":
-        log(f"[{case}]   → fpocket + Rank Fusion")
-        ap.CFG["blind_mode"] = "pocket_guided"
-        ap.CFG["pg_rank_lambda"] = cfg.get("lambda", 0.75)
-        ap.CFG["pg_quick_exh"] = 4
-        ap.CFG["pg_quick_modes"] = 3
-        ap.CFG["pg_max_pockets"] = cfg.get("max_pockets", 20)
-        ap.CFG["pg_box_size"] = cfg.get("box_size", 25.0)
+    # 用最小的配体作为 probe
+    def count_atoms(p):
         try:
-            ok, _ = ap.run_pocket_guided(
-                str(receptor_pdb), str(ligand_dir), str(case_out))
-        except Exception as e:
-            log(f"[{case}]   ✗ fpocket 异常: {e}")
-            return False
-        if not ok or not box_file.is_file():
-            log(f"[{case}]   ✗ fpocket 未生成 box")
-            return False
-        with open(box_file) as f:
-            parts = f.read().split()
-        final_center = tuple(map(float, parts[:3]))
-        final_size = tuple(map(float, parts[3:6]))
+            return sum(1 for l in open(p) if l.startswith(("ATOM", "HETATM")))
+        except OSError:
+            return 0
+    lig_pdbqts.sort(key=count_atoms)
+    probe = lig_pdbqts[0]
+    print(f"    probe: {Path(probe).stem}")
 
-    elif strategy == "p2rank_rf":
-        log(f"[{case}]   → P2Rank + Rank Fusion")
-        ok, center, size = _run_p2rank_guided(
-            receptor_pdb, ligand_dir, case_out, cfg, log)
-        if not ok:
-            return False
-        final_center = center
-        final_size = size
+    # 4. 每个口袋快速对接
+    print(f"    ★ 快速对接 {len(pockets)} 个口袋 (exh={CFG['pg_quick_exh']})...")
+    tasks = []
+    for p in pockets:
+        out_pdbqt = os.path.join(work, f"quick_{p['pocket']}.pdbqt")
+        tasks.append((rec_pdbqt, probe, p["center"], out_pdbqt, p["pocket"]))
 
-    else:
-        log(f"[{case}]   ✗ 未知策略: {strategy}")
-        return False
+    results = {}
+    n_cpus = CFG["grid_cpus"]
+    with ProcessPoolExecutor(max_workers=n_cpus) as ex:
+        futures = {ex.submit(_dock_one_pocket, t): t[4] for t in tasks}
+        for fut in as_completed(futures):
+            # 这里接收 3 个返回值
+            key, e, err = fut.result()
+            if err:
+                print(f"    [{key}] ❌ {err}")
+            results[key] = e
 
-    # ---- 精修对接 ----
-    log(f"[{case}]   → 精修 exh={cfg['exh']} modes={cfg['modes']}")
-    fine_dir = case_out / "docking_results"
-    fine_dir.mkdir(exist_ok=True)
+    # 5. Rank Fusion
+    valid = [p for p in pockets if results.get(p["pocket"]) is not None]
+    if not valid:
+        print("    ⚠ 所有口袋对接失败")
+        return False, []
+
+    by_e = sorted(valid, key=lambda p: results[p["pocket"]])
+    by_s = sorted(valid, key=lambda p: -p["score"])
+    rank_e = {p["pocket"]: i for i, p in enumerate(by_e)}
+    rank_s = {p["pocket"]: i for i, p in enumerate(by_s)}
+    lam = CFG["pg_rank_lambda"]
+    best = min(valid, key=lambda p: rank_e[p["pocket"]] + lam * rank_s[p["pocket"]])
+
+    print(f"    ✓ Rank Fusion (λ={lam}) 选中 {best['pocket']}  "
+          f"(score={best['score']:.3f}, E={results[best['pocket']]:.2f})")
+
+    # >>> AF3 DUMP: 写 pocket_ranks.json 供 af3_confidence_fusion.py 使用
+    _dump_pocket_ranks(valid, results, out_dir)
+    # <<< AF3 DUMP
+
+    final_center = best["center"]
+    box_size = CFG["pg_box_size"]
+
+    # 6. 精修：在最佳盒子里跑所有配体
+    fine_dir = os.path.join(out_dir, "docking_results")
+    os.makedirs(fine_dir, exist_ok=True)
+    print(f"    ★ 精修 (exh={CFG['exhaustiveness_fine']})...")
     ok_n = 0
-    for i, lig_pqt in enumerate(lig_pdbqts, 1):
-        out_pqt = fine_dir / f"docking_{lig_pqt.stem}.pdbqt"
-        if out_pqt.is_file() and out_pqt.stat().st_size > 100:
+    for lig_i, lig_pdbqt in enumerate(lig_pdbqts, 1):
+        lig_name = Path(lig_pdbqt).stem
+        out_pdbqt = os.path.join(fine_dir, f"docking_{lig_name}.pdbqt")
+        if os.path.isfile(out_pdbqt) and os.path.getsize(out_pdbqt) > 100:
             ok_n += 1
             continue
-        log(f"[{case}]     ({i}/{len(lig_pdbqts)}) {lig_pqt.stem}")
-        if ap.run_vina(str(rec_pdbqt), str(lig_pqt), str(out_pqt),
-                       final_center, final_size,
-                       cfg["exh"], cfg["modes"], 42):
+        print(f"      ({lig_i}/{len(lig_pdbqts)}) {lig_name} ...", end="", flush=True)
+        if run_vina(rec_pdbqt, lig_pdbqt, out_pdbqt, final_center,
+                    (box_size, box_size, box_size),
+                    CFG["exhaustiveness_fine"], CFG["num_modes_fine"], 42):
             ok_n += 1
-    log(f"[{case}]   ✓ 完成 {ok_n}/{len(lig_pdbqts)}")
+            print(" ✓")
+        else:
+            print(" ✗")
+
+    # 写 box 文件
+    box_path = os.path.join(os.path.dirname(receptor_pdb),
+                            os.path.splitext(os.path.basename(receptor_pdb))[0] + ".box")
+    with open(box_path, "w") as f:
+        f.write(f"{final_center[0]:.3f} {final_center[1]:.3f} {final_center[2]:.3f} "
+                f"{box_size:.3f} {box_size:.3f} {box_size:.3f}\n")
+    print(f"    ✅ {box_path}")
+
+    return True, [("rank_fusion", final_center)]
+
+
+# =====================================================================
+# >>> AF3 FUSION DUMP
+# =====================================================================
+def _dump_pocket_ranks(valid_pockets, energy_map, out_dir):
+    """
+    把 Rank Fusion 用到的候选口袋 dump 成 pocket_ranks.json。
+    valid_pockets : list[dict]，每项有 'pocket' / 'center' / 'score'
+    energy_map    : dict[pocket_key] -> quick vina energy
+    out_dir       : 写到这个目录下的 pocket_ranks.json
+    """
+    dump = []
+    for i, p in enumerate(valid_pockets):
+        c = p.get("center")
+        if c is None:
+            continue
+        try:
+            center_list = [float(c[0]), float(c[1]), float(c[2])]
+        except Exception:
+            continue
+
+        try:
+            drug = float(p.get("score", 0.0))
+        except Exception:
+            drug = 0.0
+
+        e = energy_map.get(p["pocket"]) if energy_map else None
+        try:
+            e = float(e) if e is not None else 0.0
+        except Exception:
+            e = 0.0
+
+        dump.append({
+            "index":        i,
+            "pocket":       p["pocket"],
+            "center":       center_list,
+            "druggability": drug,
+            "vina_energy":  e,
+        })
+
+    if not dump:
+        print("    ⚠ pocket_ranks.json: 没有可 dump 的口袋")
+        return
+
+    try:
+        out = Path(out_dir) / "pocket_ranks.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(dump, f, indent=2)
+        print(f"    ✓ pocket_ranks.json ({len(dump)} pockets) → {out}")
+    except Exception as e:
+        print(f"    ⚠ pocket_ranks.json 写入失败: {e}")
+# =====================================================================
+# <<< AF3 FUSION DUMP
+# =====================================================================
+
+
+# =====================================================================
+# 单盒模式 / 网格模式（保留原逻辑）
+# =====================================================================
+def run_blind_single(receptor_pdb, ligand_dir, seed, out_dir=None):
+    """简化版：bbox + max_size"""
+    if out_dir is None:
+        out_dir = ligand_dir
+    work = os.path.join(out_dir, "work")
+    os.makedirs(work, exist_ok=True)
+    out_docking = os.path.join(out_dir, "docking_results")
+    os.makedirs(out_docking, exist_ok=True)
+
+    rec_pdbqt = os.path.join(work, "receptor.pdbqt")
+    # 使用自动清洗与修复
+    if not ensure_valid_receptor_pdbqt(receptor_pdb, rec_pdbqt):
+        return False
+
+    center, size = compute_bounding_box(rec_pdbqt, CFG["blind_padding"],
+                                         CFG["blind_max_size"])
+    if not center:
+        return False
+
+    ligs = sorted(Path(ligand_dir).glob(f"*{CFG['ligand_ext']}"))
+    lig_pdbqts = []
+    for lig in ligs:
+        lig_pdbqt = os.path.join(work, f"{lig.stem}.pdbqt")
+        if not os.path.isfile(lig_pdbqt) or os.path.getsize(lig_pdbqt) < 100:
+            if not pdb_to_pdbqt_ligand(str(lig), lig_pdbqt):
+                continue
+        lig_pdbqts.append(lig_pdbqt)
+
+    ok_n = 0
+    for lig_pdbqt in lig_pdbqts:
+        lig_name = Path(lig_pdbqt).stem
+        out_pdbqt = os.path.join(out_docking, f"docking_{lig_name}.pdbqt")
+        if os.path.isfile(out_pdbqt) and os.path.getsize(out_pdbqt) > 100:
+            ok_n += 1
+            continue
+        if run_vina(rec_pdbqt, lig_pdbqt, out_pdbqt, center, size,
+                    CFG["exhaustiveness_blind"], CFG["num_modes_blind"], seed):
+            ok_n += 1
     return ok_n > 0
 
 
 # =====================================================================
-# P2Rank 引导子流程
+# 精对接
 # =====================================================================
-def _run_p2rank_guided(receptor_pdb, ligand_dir, case_out, cfg, log):
-    """返回 (ok, center, size)。"""
-    receptor_pdb = Path(receptor_pdb)
-    ligand_dir = Path(ligand_dir)
-    case_out = Path(case_out)
-    case = receptor_pdb.stem
+def run_fine_native(receptor_pdb, ligand_dir, box_path):
+    work = os.path.join(ligand_dir, "work_fine")
+    os.makedirs(work, exist_ok=True)
+    out_docking = os.path.join(ligand_dir, "docking_results")
+    if os.path.isdir(out_docking):
+        shutil.rmtree(out_docking)
+    os.makedirs(out_docking, exist_ok=True)
 
-    # 1. 检查 P2Rank
-    p2rank_dir = resolve_p2rank_dir()
-    if p2rank_dir is None:
-        log(f"[{case}]   ✗ P2Rank 未找到")
-        log(f"[{case}]     请放到 {_ROOT / 'tools' / 'p2rank_2.6-alpha'}")
-        log(f"[{case}]     或设置环境变量 P2RANK_DIR")
-        return False, None, None
+    rec_pdbqt = os.path.join(work, "receptor.pdbqt")
+    # 使用自动清洗与修复
+    if not ensure_valid_receptor_pdbqt(receptor_pdb, rec_pdbqt):
+        return False
 
-    # 2. 检查配体目录里有 .pdb
-    pdb_ligs = list(ligand_dir.glob("*.pdb"))
-    if not pdb_ligs:
-        log(f"[{case}]   ⚠ 配体目录无 .pdb 文件，尝试从 sdf/mol 转换…")
-        sdf_ligs = list(ligand_dir.glob("*.sdf")) + \
-                   list(ligand_dir.glob("*.mol"))
-        if sdf_ligs and ap.OBABEL_BIN:
-            probe_pdb = ligand_dir / "_probe_from_sdf.pdb"
-            import subprocess
-            try:
-                subprocess.run(
-                    [ap.OBABEL_BIN, str(sdf_ligs[0]), "-O",
-                     str(probe_pdb)], capture_output=True, timeout=60)
-            except Exception:
-                pass
-            if probe_pdb.is_file():
-                pdb_ligs = [probe_pdb]
-        if not pdb_ligs:
-            log(f"[{case}]   ✗ 无法获得 .pdb 配体，P2Rank 引导失败")
-            return False, None, None
-
-    # 3. 设置 prf 路径变量
-    p2rank_out = WORK_ROOT / "p2rank_out"
-    p2rank_out.mkdir(parents=True, exist_ok=True)
-    prf.P2RANK_OUT_ROOT = p2rank_out
-    prf.WORK_ROOT = WORK_ROOT / "p2rank_rf"
-    prf.WORK_ROOT.mkdir(parents=True, exist_ok=True)
-
-    # 4. 未跑过 P2Rank 则先跑
-    has_pred = any(p2rank_out.rglob(f"{case}.pdb_predictions.csv"))
-    if not has_pred:
-        log(f"[{case}]   → 先运行 P2Rank 检测")
-        prb.P2RANK_DIR = p2rank_dir
-        prb.WORK_ROOT = WORK_ROOT / "p2rank_work"
-        prb.WORK_ROOT.mkdir(parents=True, exist_ok=True)
-        try:
-            _, info = prb.run_one(
-                (case, str(receptor_pdb), str(p2rank_out)))
-        except Exception as e:
-            log(f"[{case}]   ✗ P2Rank 运行异常: {e}")
-            return False, None, None
-        if info is None:
-            log(f"[{case}]   ✗ P2Rank 未产出预测")
-            return False, None, None
-
-    # 5. 构造适配 run_p2rank_rankfusion 的目录结构
-    #    期望 exp_dir/case/receptor.pdb
-    tmp_exp = case_out / "_tmp_exp"
-    tmp_case = tmp_exp / case
-    tmp_case.mkdir(parents=True, exist_ok=True)
-    tmp_rec = tmp_case / "receptor.pdb"
-    if not tmp_rec.is_file():
-        shutil.copy2(receptor_pdb, tmp_rec)
-
-    # 期望 ligand_parent/case/*.pdb
-    if ligand_dir.name == case:
-        # 配体目录本身就是 case 目录（标准布局）
-        ligand_parent_arg = ligand_dir.parent
-    else:
-        # 名字不同，构造临时结构
-        tmp_lig_parent = case_out / "_tmp_lig"
-        tmp_lig_case = tmp_lig_parent / case
-        tmp_lig_case.mkdir(parents=True, exist_ok=True)
-        for lig in ligand_dir.iterdir():
-            if lig.is_file() and lig.suffix.lower() == ".pdb":
-                dst = tmp_lig_case / lig.name
-                if not dst.is_file():
-                    shutil.copy2(lig, dst)
-        ligand_parent_arg = tmp_lig_parent
-
-    # 6. 调用 Rank Fusion
-    try:
-        _, center, info = prf.process_one(
-            case, str(tmp_exp), str(ligand_parent_arg), str(case_out))
-    except Exception as e:
-        log(f"[{case}]   ✗ P2Rank 引导异常: {e}")
-        return False, None, None
-
-    if center is None:
-        log(f"[{case}]   ✗ P2Rank 引导失败: {info}")
-        return False, None, None
-
-    # 7. 复制 box
-    src_box = case_out / f"p2rank_rf_{case}.box"
-    dst_box = case_out / "receptor.box"
-    box_size = cfg.get("box_size", 25.0)
-    if src_box.is_file():
-        shutil.copy(src_box, dst_box)
-    else:
-        with open(dst_box, "w") as f:
-            f.write(f"{center[0]:.3f} {center[1]:.3f} {center[2]:.3f} "
-                    f"{box_size:.3f} {box_size:.3f} {box_size:.3f}\n")
-    return True, tuple(center), (box_size, box_size, box_size)
+    center, size = read_box_file(box_path)
+    ligs = sorted(Path(ligand_dir).glob(f"*{CFG['ligand_ext']}"))
+    ok_n = 0
+    for lig in ligs:
+        lig_pdbqt = os.path.join(work, f"{lig.stem}.pdbqt")
+        if not os.path.isfile(lig_pdbqt) or os.path.getsize(lig_pdbqt) < 100:
+            if not pdb_to_pdbqt_ligand(str(lig), lig_pdbqt):
+                continue
+        out_pdbqt = os.path.join(out_docking, f"docking_{lig.stem}.pdbqt")
+        if run_vina(rec_pdbqt, lig_pdbqt, out_pdbqt, center, size,
+                    CFG["exhaustiveness_fine"], CFG["num_modes_fine"], 42):
+            ok_n += 1
+    return ok_n > 0
 
 
 # =====================================================================
-# 批量运行线程
+# CSV 导出
 # =====================================================================
-def run_all_thread(receptor_dir, ligand_parent, out_root, strategy,
-                   cfg, log, progress_cb, stop_event):
-    rec_dir = Path(receptor_dir)
-    lig_parent = Path(ligand_parent)
-    out_root = Path(out_root)
-    out_root.mkdir(parents=True, exist_ok=True)
-
-    pdbs = sorted(p for p in rec_dir.glob("*.pdb") if p.is_file())
-    if not pdbs:
-        log(f"❌ {rec_dir} 下无 *.pdb")
+def export_hotspot_csv(lig_dir, all_poses, clusters, labels):
+    if not CFG["export_csv"]:
         return
+    csv1 = os.path.join(lig_dir, "hotspot_clusters.csv")
+    with open(csv1, "w", newline="", encoding="utf-8") as f:
+        f.write("Cluster,Poses,Pct,Center_X,Center_Y,Center_Z,"
+                "Span_X,Span_Y,Span_Z,Min_Energy,Mean_Energy\n")
+        for i, c in enumerate(clusters, 1):
+            pct = 100 * c["size"] / len(all_poses)
+            f.write(f"{i},{c['size']},{pct:.2f},{c['center'][0]:.3f},"
+                    f"{c['center'][1]:.3f},{c['center'][2]:.3f},"
+                    f"{c['span'][0]:.3f},{c['span'][1]:.3f},{c['span'][2]:.3f},"
+                    f"{c['min_energy'] or ''},{c['mean_energy'] or ''}\n")
+    print(f"  ✅ {csv1}")
 
-    log(f"\n发现 {len(pdbs)} 个大分子")
-    ok = fail = 0
-    for i, rec in enumerate(pdbs, 1):
-        if stop_event.is_set():
-            log("\n⏹ 用户中断")
-            break
-        case = rec.stem
-        lig_dir = lig_parent / case
-        if not lig_dir.is_dir():
-            log(f"[{i}/{len(pdbs)}] {case}   ⚠ 无配体目录，跳过")
-            fail += 1
-            progress_cb(i, len(pdbs), case)
+
+def export_fine_csv(lig_dir):
+    if not CFG["export_csv"]:
+        return
+    fine_dir = os.path.join(lig_dir, "docking_results")
+    if not os.path.isdir(fine_dir):
+        return
+    rows = []
+    for fp in sorted(Path(fine_dir).glob("docking_*.pdbqt")):
+        poses = parse_poses(str(fp))
+        if not poses:
             continue
-        progress_cb(i - 1, len(pdbs), case)
-        try:
-            if process_one_case(case, rec, lig_dir, out_root,
-                                strategy, cfg, log):
-                ok += 1
-            else:
-                fail += 1
-        except Exception as e:
-            log(f"[{i}/{len(pdbs)}] {case}   ❌ 异常: {e}")
-            traceback.print_exc()
-            fail += 1
-        progress_cb(i, len(pdbs), case)
-
-    log(f"\n{'=' * 60}")
-    log(f"✅ 完成: 成功 {ok} / 失败 {fail} / 总 {len(pdbs)}")
-    log(f"📁 输出: {out_root.resolve()}")
-    log(f"{'=' * 60}")
+        energies = [p["energy"] for p in poses if p["energy"] is not None]
+        best = min(energies) if energies else None
+        rows.append((fp.stem.replace("docking_", ""), best, len(poses)))
+    rows.sort(key=lambda r: r[1] if r[1] is not None else 999)
+    path = os.path.join(lig_dir, "fine_results.csv")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write("Ligand,Best_Energy_kcal_mol,Num_Poses\n")
+        for n, b, c in rows:
+            f.write(f"{n},{f'{b:.3f}' if b is not None else ''},{c}\n")
+    print(f"  ✅ {path}")
 
 
-# =====================================================================
-# GUI
-# =====================================================================
-class DockingApp:
-    def __init__(self, root):
-        self.root = root
-        root.title("大分子-小分子对接软件")
-        root.geometry("980x780")
-        self._stop_event = threading.Event()
-        self._worker = None
-        self._build_ui()
-
-    def _build_ui(self):
-        # ===== 顶部路径 =====
-        top = ttk.LabelFrame(self.root, text="1. 数据路径", padding=10)
-        top.pack(fill="x", padx=10, pady=6)
-
-        ttk.Label(top, text="大分子文件夹:").grid(
-            row=0, column=0, sticky="w")
-        self.rec_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.rec_var, width=70).grid(
-            row=0, column=1, padx=6)
-        ttk.Button(top, text="选择…",
-                   command=self._pick_rec).grid(row=0, column=2)
-
-        ttk.Label(top, text="小分子父文件夹:").grid(
-            row=1, column=0, sticky="w", pady=4)
-        self.lig_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.lig_var, width=70).grid(
-            row=1, column=1, padx=6)
-        ttk.Button(top, text="选择…",
-                   command=self._pick_lig).grid(row=1, column=2)
-
-        ttk.Label(top, text="输出目录:").grid(
-            row=2, column=0, sticky="w", pady=4)
-        self.out_var = tk.StringVar()
-        ttk.Entry(top, textvariable=self.out_var, width=70).grid(
-            row=2, column=1, padx=6)
-        ttk.Button(top, text="选择…",
-                   command=self._pick_out).grid(row=2, column=2)
-
-        # ===== Box 策略 =====
-        mid = ttk.LabelFrame(self.root, text="2. Box 选择策略", padding=10)
-        mid.pack(fill="x", padx=10, pady=6)
-
-        self.strategy_var = tk.StringVar(value="fpocket_rf")
-        for key, label in BOX_STRATEGIES:
-            ttk.Radiobutton(
-                mid, text=label, variable=self.strategy_var,
-                value=key, command=self._on_strategy_change
-            ).pack(anchor="w")
-
-        manual_row = ttk.Frame(mid)
-        manual_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(manual_row, text="  手动 box 文件:").pack(side="left")
-        self.manual_box_var = tk.StringVar()
-        self.manual_entry = ttk.Entry(
-            manual_row, textvariable=self.manual_box_var, width=55)
-        self.manual_entry.pack(side="left", padx=6)
-        self.manual_btn = ttk.Button(
-            manual_row, text="选择…", command=self._pick_manual_box)
-        self.manual_btn.pack(side="left")
-        self._manual_widgets = [self.manual_entry, self.manual_btn]
-        self._on_strategy_change()
-
-        # ===== 参数 =====
-        cfg = ttk.LabelFrame(self.root, text="3. 对接参数", padding=10)
-        cfg.pack(fill="x", padx=10, pady=6)
-
-        ttk.Label(cfg, text="预设:").grid(row=0, column=0, sticky="w")
-        self.preset_var = tk.StringVar(value=PRESETS["standard"]["label"])
-        preset_box = ttk.Combobox(
-            cfg, textvariable=self.preset_var, state="readonly",
-            values=[v["label"] for v in PRESETS.values()], width=26)
-        preset_box.grid(row=0, column=1, sticky="w", padx=6)
-        preset_box.bind("<<ComboboxSelected>>", self._on_preset_change)
-
-        ttk.Label(cfg, text="exhaustiveness:").grid(
-            row=0, column=2, padx=(20, 4), sticky="w")
-        self.exh_var = tk.IntVar(value=32)
-        ttk.Spinbox(cfg, from_=1, to=128, textvariable=self.exh_var,
-                    width=8).grid(row=0, column=3)
-
-        ttk.Label(cfg, text="num_modes:").grid(
-            row=0, column=4, padx=(20, 4), sticky="w")
-        self.modes_var = tk.IntVar(value=20)
-        ttk.Spinbox(cfg, from_=1, to=100, textvariable=self.modes_var,
-                    width=8).grid(row=0, column=5)
-
-        ttk.Label(cfg, text="Rank Fusion λ:").grid(
-            row=1, column=0, sticky="w", pady=4)
-        self.lambda_var = tk.DoubleVar(value=0.75)
-        ttk.Spinbox(cfg, from_=0.0, to=10.0, increment=0.05,
-                    textvariable=self.lambda_var,
-                    width=10).grid(row=1, column=1, sticky="w", padx=6)
-
-        ttk.Label(cfg, text="最大口袋数:").grid(
-            row=1, column=2, padx=(20, 4), sticky="w")
-        self.maxp_var = tk.IntVar(value=20)
-        ttk.Spinbox(cfg, from_=1, to=100,
-                    textvariable=self.maxp_var, width=8).grid(
-            row=1, column=3)
-
-        ttk.Label(cfg, text="box 边长 (Å):").grid(
-            row=1, column=4, padx=(20, 4), sticky="w")
-        self.boxsz_var = tk.DoubleVar(value=25.0)
-        ttk.Spinbox(cfg, from_=10.0, to=60.0, increment=1.0,
-                    textvariable=self.boxsz_var, width=8).grid(
-            row=1, column=5)
-
-        # ===== 控制按钮 =====
-        ctrl = ttk.Frame(self.root)
-        ctrl.pack(fill="x", padx=10, pady=(4, 6))
-        self.run_btn = ttk.Button(ctrl, text="▶ 开始运行",
-                                  command=self._start)
-        self.run_btn.pack(side="left")
-        self.stop_btn = ttk.Button(ctrl, text="⏹ 停止",
-                                   command=self._stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=6)
-
-        ttk.Label(ctrl, text="进度:").pack(side="left", padx=(20, 4))
-        self.pbar = ttk.Progressbar(ctrl, length=420)
-        self.pbar.pack(side="left")
-        self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(ctrl, textvariable=self.status_var).pack(
-            side="left", padx=10)
-
-        # ===== 日志 =====
-        logf = ttk.LabelFrame(self.root, text="运行日志", padding=6)
-        logf.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        self.log_txt = scrolledtext.ScrolledText(
-            logf, height=20, font=("Consolas", 9), wrap="word")
-        self.log_txt.pack(fill="both", expand=True)
-
-    # -------- 路径选择 --------
-    def _pick_rec(self):
-        d = filedialog.askdirectory(title="选择大分子文件夹")
-        if d:
-            self.rec_var.set(d)
-            if not self.out_var.get():
-                self.out_var.set(str(Path(d).parent / "docking_out"))
-
-    def _pick_lig(self):
-        d = filedialog.askdirectory(title="选择小分子父文件夹")
-        if d:
-            self.lig_var.set(d)
-
-    def _pick_out(self):
-        d = filedialog.askdirectory(title="选择输出目录")
-        if d:
-            self.out_var.set(d)
-
-    def _pick_manual_box(self):
-        f = filedialog.askopenfilename(
-            title="选择 box 文件",
-            filetypes=[("Box files", "*.box"), ("All", "*.*")])
-        if f:
-            self.manual_box_var.set(f)
-
-    def _on_strategy_change(self):
-        state = "normal" if self.strategy_var.get() == "manual" \
-                else "disabled"
-        for w in self._manual_widgets:
-            w.configure(state=state)
-
-    def _on_preset_change(self, _e=None):
-        label = self.preset_var.get()
-        for key, p in PRESETS.items():
-            if p["label"] == label and key != "custom":
-                self.exh_var.set(p["exh"])
-                self.modes_var.set(p["modes"])
-                return
-
-    # -------- 运行控制 --------
-    def _log(self, msg):
-        self.log_txt.insert("end", msg + "\n")
-        self.log_txt.see("end")
-
-    def _log_safe(self, msg):
-        self.root.after(0, self._log, msg)
-
-    def _set_progress(self, done, total, case):
-        self.pbar["maximum"] = total
-        self.pbar["value"] = done
-        self.status_var.set(f"{done}/{total}  {case}")
-
-    def _set_progress_safe(self, done, total, case):
-        self.root.after(0, self._set_progress, done, total, case)
-
-    def _start(self):
-        rec = self.rec_var.get().strip()
-        lig = self.lig_var.get().strip()
-        out = self.out_var.get().strip()
-        strategy = self.strategy_var.get()
-
-        if not rec or not Path(rec).is_dir():
-            messagebox.showerror("错误", "请选择有效的大分子文件夹")
-            return
-        if not lig or not Path(lig).is_dir():
-            messagebox.showerror("错误", "请选择有效的小分子父文件夹")
-            return
-        if not out:
-            messagebox.showerror("错误", "请选择输出目录")
-            return
-        if strategy == "manual" and not Path(
-                self.manual_box_var.get()).is_file():
-            messagebox.showerror("错误", "手动模式必须选择有效的 .box 文件")
-            return
-
-        cfg = {
-            "exh": int(self.exh_var.get()),
-            "modes": int(self.modes_var.get()),
-            "lambda": float(self.lambda_var.get()),
-            "max_pockets": int(self.maxp_var.get()),
-            "box_size": float(self.boxsz_var.get()),
-            "manual_box": self.manual_box_var.get()
-                          if strategy == "manual" else None,
-        }
-
-        self.log_txt.delete("1.0", "end")
-        self._log("=" * 60)
-        self._log("开始对接")
-        self._log("=" * 60)
-        self._log(f"大分子: {rec}")
-        self._log(f"小分子: {lig}")
-        self._log(f"输出:   {out}")
-        self._log(f"策略:   {strategy}")
-        self._log(f"参数:   {cfg}")
-        self._log(f"项目根: {_ROOT}")
-        self._log("\n环境自检:")
-        if not check_environment(self._log):
-            if not messagebox.askyesno(
-                    "环境警告",
-                    "部分工具缺失，可能导致运行失败。继续？"):
-                return
-
-        self.run_btn.configure(state="disabled")
-        self.stop_btn.configure(state="normal")
-        self._stop_event.clear()
-        self._worker = threading.Thread(
-            target=self._run_worker,
-            args=(rec, lig, out, strategy, cfg), daemon=True)
-        self._worker.start()
-
-    def _run_worker(self, rec, lig, out, strategy, cfg):
-        try:
-            run_all_thread(rec, lig, out, strategy, cfg,
-                           self._log_safe, self._set_progress_safe,
-                           self._stop_event)
-        except Exception as e:
-            self._log_safe(f"❌ 运行异常: {e}")
-            self._log_safe(traceback.format_exc())
-        finally:
-            self.root.after(0, self._on_finish)
-
-    def _on_finish(self):
-        self.run_btn.configure(state="normal")
-        self.stop_btn.configure(state="disabled")
-        self.status_var.set("就绪")
-
-    def _stop(self):
-        self._stop_event.set()
-        self._log("⏹ 已发送停止信号，等待当前 case 完成…")
+def archive_results(src, dst):
+    if os.path.exists(dst):
+        shutil.rmtree(dst)
+    if os.path.exists(src):
+        shutil.move(src, dst)
 
 
 # =====================================================================
-# CLI 模式
+# 主流程
 # =====================================================================
-def cli_main():
-    import argparse
-    p = argparse.ArgumentParser(description="大分子-小分子对接 CLI")
-    p.add_argument("--receptor_dir", required=True)
-    p.add_argument("--ligand_parent", required=True)
-    p.add_argument("--out_dir", required=True)
-    p.add_argument("--strategy", default="fpocket_rf",
-                   choices=[k for k, _ in BOX_STRATEGIES])
-    p.add_argument("--exh", type=int, default=32)
-    p.add_argument("--modes", type=int, default=20)
-    p.add_argument("--lambda_", type=float, default=0.75)
-    p.add_argument("--max_pockets", type=int, default=20)
-    p.add_argument("--box_size", type=float, default=25.0)
-    p.add_argument("--manual_box", default=None)
-    a = p.parse_args()
+def process_receptor(receptor_pdb, ligand_parent):
+    name = os.path.splitext(os.path.basename(receptor_pdb))[0]
+    lig_dir = os.path.join(ligand_parent, name)
 
-    cfg = {
-        "exh": a.exh, "modes": a.modes, "lambda": a.lambda_,
-        "max_pockets": a.max_pockets, "box_size": a.box_size,
-        "manual_box": a.manual_box,
-    }
-    check_environment(print)
-    run_all_thread(a.receptor_dir, a.ligand_parent, a.out_dir,
-                   a.strategy, cfg,
-                   lambda m: print(m, flush=True),
-                   lambda d, t, c: None, threading.Event())
+    print(f"\n{'=' * 70}\n[{name}]")
+    print(f"  受体: {receptor_pdb}")
+    print(f"  配体: {lig_dir}")
+    print(f"  模式: {CFG['blind_mode']}")
+    print(f"{'=' * 70}")
+
+    if not os.path.isdir(lig_dir):
+        print(f"  ❌ 配体目录不存在")
+        return False
+
+    if CFG["blind_mode"] == "pocket_guided":
+        # ★ 口袋引导模式
+        ok, _ = run_pocket_guided(receptor_pdb, lig_dir, lig_dir)
+        if not ok:
+            print("  ❌ 口袋引导失败")
+            return False
+        export_fine_csv(lig_dir)
+        return True
+
+    elif CFG["blind_mode"] == "single":
+        tmp_dir = os.path.join(lig_dir, "_tmp_single")
+        for seed in range(1, CFG["n_seeds"] + 1):
+            print(f"    seed={seed}")
+            run_blind_single(receptor_pdb, lig_dir, seed, out_dir=tmp_dir)
+            dst = os.path.join(lig_dir, f"blind_seed_{seed}")
+            archive_results(os.path.join(tmp_dir, "docking_results"), dst)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        all_poses = []
+        for d in Path(lig_dir).glob("blind_seed_*"):
+            all_poses.extend(load_all_poses(str(d), conformer="crystal"))
+        if not all_poses:
+            return False
+        clusters, labels = cluster_poses(all_poses, CFG["eps"], CFG["min_samples"])
+        clusters = annotate_cluster_conformers(clusters, all_poses, labels)
+        if not clusters:
+            return False
+        top = clusters[0]
+        center = tuple(top["center"])
+        bs = CFG["box_size"]
+        box_path = os.path.join(os.path.dirname(receptor_pdb), name + ".box")
+        with open(box_path, "w") as f:
+            f.write(f"{center[0]:.3f} {center[1]:.3f} {center[2]:.3f} "
+                    f"{bs:.3f} {bs:.3f} {bs:.3f}\n")
+        export_hotspot_csv(lig_dir, all_poses, clusters, labels)
+        if CFG["run_fine"]:
+            run_fine_native(receptor_pdb, lig_dir, box_path)
+            export_fine_csv(lig_dir)
+        return True
+
+    else:
+        print(f"  ⚠ grid 模式需要完整代码（见之前的版本）")
+        return False
 
 
 # =====================================================================
-# 入口
+# 批量入口
 # =====================================================================
-def main():
-    if not resolve_vina():
-        print("❌ 未找到 vina", file=sys.stderr)
-        print(f"   请放到 {_ROOT / 'tools' / 'vina' / 'vina.exe'}")
-        print("   或设置 VINA_BIN 环境变量")
-        sys.exit(1)
+def _list_pdbs(d):
+    return sorted(f for f in os.listdir(d)
+                  if f.lower().endswith(".pdb")
+                  and os.path.isfile(os.path.join(d, f)))
 
-    if "--cli" in sys.argv:
-        sys.argv.remove("--cli")
-        cli_main()
+
+def run_all():
+    rec_dir, lig_parent = CFG["receptor_dir"], CFG["ligand_parent"]
+    if not os.path.isdir(rec_dir) or not os.path.isdir(lig_parent):
+        print("❌ 目录无效")
         return
+    pdbs = _list_pdbs(rec_dir)
+    if not pdbs:
+        print("❌ 无 .pdb")
+        return
+    print(f"\n发现 {len(pdbs)} 受体")
+    ok_n = fail_n = 0
+    for p in pdbs:
+        try:
+            if process_receptor(os.path.join(rec_dir, p), lig_parent):
+                ok_n += 1
+            else:
+                fail_n += 1
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            fail_n += 1
+    print(f"\n完成: {ok_n} 成功 / {fail_n} 失败")
 
-    root = tk.Tk()
-    DockingApp(root)
-    root.mainloop()
+
+# =====================================================================
+# 菜单
+# =====================================================================
+def choose_folder(title):
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        r = tk.Tk()
+        r.withdraw()
+        d = filedialog.askdirectory(title=title)
+        r.destroy()
+        if d:
+            return d
+    except Exception:
+        pass
+    return input(f"{title}（路径）: ").strip()
+
+
+def menu():
+    print("\n" + "=" * 70)
+    print("  全自动对接（单盒 / 网格 / ★口袋引导 Rank Fusion）")
+    print("=" * 70)
+    print(f"  大分子:   {CFG['receptor_dir'] or '(未设置)'}")
+    print(f"  小分子:   {CFG['ligand_parent'] or '(未设置)'}")
+    print(f"  盲模式:   {CFG['blind_mode']}")
+    if CFG["blind_mode"] == "pocket_guided":
+        print(f"    fpocket: min_vol={CFG['pg_min_volume']}Å³ "
+              f"max_pockets={CFG['pg_max_pockets']}")
+        print(f"    快接:   exh={CFG['pg_quick_exh']} modes={CFG['pg_quick_modes']}")
+        print(f"    Rank Fusion: λ={CFG['pg_rank_lambda']} "
+              f"box={CFG['pg_box_size']}Å")
+    print(f"  精对接:   exh={CFG['exhaustiveness_fine']} "
+          f"modes={CFG['num_modes_fine']}")
+    print(f"  工具:     vina={'✓' if VINA_BIN else '✗'}  "
+          f"obabel={'✓' if OBABEL_BIN else '✗'}")
+    print("=" * 70)
+    print("  1. 选大分子文件夹")
+    print("  2. 选小分子父文件夹")
+    print("  3. 调整参数")
+    print("  4. ▶ 全自动运行")
+    print("  0. 退出")
+    print("=" * 70)
+
+
+def adjust_params():
+    print()
+    s = input(f"  模式 single/grid/pocket_guided（当前 {CFG['blind_mode']}）: ").strip().lower()
+    if s in ("single", "grid", "pocket_guided"):
+        CFG["blind_mode"] = s
+
+    if CFG["blind_mode"] == "pocket_guided":
+        print("\n  --- 口袋引导模式 ---")
+        fields = [
+            ("pg_min_volume", "口袋最小体积 Å³", float),
+            ("pg_max_pockets", "最多口袋数", int),
+            ("pg_quick_exh", "快速对接 exh", int),
+            ("pg_quick_modes", "快速对接 modes", int),
+            ("pg_rank_lambda", "Rank Fusion λ", float),
+            ("pg_box_size", "精修盒子边长", float),
+            ("pg_wsl_env", "WSL conda 环境名", str),
+        ]
+        for k, lab, t in fields:
+            v = input(f"  {lab}（当前 {CFG[k]}）: ").strip()
+            if v:
+                try:
+                    CFG[k] = t(v)
+                except ValueError:
+                    pass
+
+    print("\n  --- 精对接 ---")
+    for k, lab, t in [("exhaustiveness_fine", "exh", int),
+                      ("num_modes_fine", "modes", int)]:
+        v = input(f"  {lab}（当前 {CFG[k]}）: ").strip()
+        if v:
+            try:
+                CFG[k] = t(v)
+            except ValueError:
+                pass
+
+
+def main():
+    if not VINA_BIN:
+        print("❌ 未找到 vina")
+        sys.exit(1)
+    while True:
+        menu()
+        c = input("请选择: ").strip()
+        if c == "0":
+            return
+        elif c == "1":
+            d = choose_folder("选择大分子文件夹")
+            if d:
+                CFG["receptor_dir"] = d
+                print(f"✅ {d}")
+        elif c == "2":
+            d = choose_folder("选择小分子父文件夹")
+            if d:
+                CFG["ligand_parent"] = d
+                print(f"✅ {d}")
+        elif c == "3":
+            adjust_params()
+        elif c == "4":
+            if not CFG["receptor_dir"] or not CFG["ligand_parent"]:
+                print("❌ 先设置路径")
+                continue
+            run_all()
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()
