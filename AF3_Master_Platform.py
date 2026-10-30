@@ -1,8 +1,8 @@
 # pyright: reportAttributeAccessIssue=false
 #!/usr/bin/env python3
 """
-AF3_Master_Platform.py — AF3 结构与下游干预综合软件平台 (终极致命无错版)
-包含：类型安全配置读取、中英双语动态切换、环境配置持久化、全流程自动化
+AF3_Master_Platform.py — AF3 结构与下游干预综合软件平台 (完整终结版)
+包含了：底层 print 拦截、缓存清理、强制加载、中英文切换
 """
 import os
 import sys
@@ -11,6 +11,8 @@ import shutil
 import threading
 import traceback
 import subprocess
+import contextlib
+import io
 from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 import tkinter as tk
@@ -18,7 +20,18 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from datetime import datetime
 
 # =====================================================================
-# 依赖检查
+# 1. 强制清理 __pycache__ (防止旧字节码导致模块缺失)
+# =====================================================================
+_ROOT_DIR = Path(__file__).resolve().parent
+for _root, _dirs, _files in os.walk(_ROOT_DIR):
+    if "__pycache__" in _dirs:
+        try:
+            shutil.rmtree(os.path.join(_root, "__pycache__"))
+        except Exception:
+            pass
+
+# =====================================================================
+# 2. 依赖检查
 # =====================================================================
 MISSING_DEPS: List[str] = []
 try:
@@ -35,7 +48,7 @@ except ImportError:
 # =====================================================================
 TRANSLATIONS: Dict[str, Dict[str, str]] = {
     "zh": {
-        "app_title": "AF3 综合流水线与分子对接综合平台 (Master OOP)",
+        "app_title": "AF3 综合流水线与分子对接综合平台",
         "lang_lbl": "语言:",
         "env_frame": "0. 全局环境配置 (修改后点击任务自动保存)",
         "vina_lbl": "Vina 程序:",
@@ -49,11 +62,12 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "tab_dock": "2. 分子对接 (Vina)",
         "tab_probe": "3. 探针与空腔分析",
         "tab_openmm": "4. 物理干预 (OpenMM)",
-        
-        "conv_desc": "将 AF3 的 CIF 转换为 PDB，并使用 DLPacker 重构侧链",
+
+        "conv_desc": "将 AF3 的 CIF 转换为 PDB，并使用 DLPacker 重构侧链；也可将小分子 SDF 批量转为 PDB",
         "btn_cif2pdb": "▶ 批量 CIF 转 PDB",
         "btn_dlp": "▶ 批量 DLPacker 侧链重建",
-        
+        "btn_sdf2pdb": "▶ 批量 SDF 转 PDB",
+
         "dock_data_frame": "数据路径",
         "rec_lbl": "大分子文件夹:",
         "lig_lbl": "小分子父文件夹:",
@@ -76,27 +90,29 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "maxp_lbl": "最大口袋数:",
         "boxsz_lbl": "box 边长 (Å):",
         "btn_run_dock": "▶ 开始运行对接",
-        
+
         "probe_desc": "计算真值配体位置处的空腔探针半径，并对比不同结构",
         "btn_probe_compare": "▶ 全量探针对比 (AF3 vs OpenMM vs DLP)",
         "btn_probe_survive": "▶ 分析奇迹生还案例",
-        
+
         "openmm_desc": "利用 OpenMM 进行侧链修复、冷热循环退火或配体引导插入",
         "btn_cold": "▶ 冷冻-回暖循环 (cold.py)",
         "btn_fit": "▶ 渐进式物理牵引 (ligand_fit.py)",
         "btn_verify": "▶ 四层热力学验证 (every case.py)",
-        
+
         "btn_stop": "⏹ 停止当前任务",
         "status_ready": "就绪",
         "log_frame": "运行日志",
-        
+
         "msg_missing_deps": "⚠ 警告: 你的环境缺少依赖 {}。涉及底层计算的脚本可能无法运行。\n  请在终端执行: pip install numpy gemmi",
         "msg_err_gemmi": "缺少 gemmi 库，无法执行此任务。\n请在终端运行: pip install gemmi",
-        "msg_err_pipeline": "缺少必要的 Python 依赖 (numpy 等)，无法进行对接。\n请在终端运行: pip install numpy pandas gemmi scikit-learn",
+        "msg_err_pipeline": "缺少必要的 Python 依赖或 auto_pipeline 加载失败！\n请检查终端警告信息。",
         "msg_err_vina": "请指定正确的 Vina 程序路径！",
         "msg_err_path": "请选择有效的大分子或配体文件夹",
         "msg_err_out": "请选择输出目录",
         "msg_err_manual": "手动模式必须选择有效的 .box 文件",
+        "msg_err_obabel": "请先配置 Obabel 程序路径！",
+        "msg_no_sdf": "所选目录下没有 .sdf 文件",
         "msg_save_err": "⚠ 配置保存失败: {}",
         "log_task_start": "▶ 开始新任务 {}",
         "log_task_end": "✅ 任务结束 {}",
@@ -135,9 +151,11 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "log_exec_err": "执行异常: {}",
         "log_dock_exc": "[{}/{}] {}   ❌ 异常: {}",
         "log_user_abort": "\n⏹ 用户中断",
+        "log_sdf_start": "找到 {} 个 SDF 文件，开始转 PDB...",
+        "log_sdf_total": "\n✅ SDF→PDB 完成: 成功 {} / 失败 {} / 总 {}",
     },
     "en": {
-        "app_title": "AF3 Comprehensive Pipeline & Docking Platform (Master OOP)",
+        "app_title": "AF3 Comprehensive Pipeline & Docking Platform",
         "lang_lbl": "Language:",
         "env_frame": "0. Global Environment Config (Auto-saved on execution)",
         "vina_lbl": "Vina Executable:",
@@ -151,11 +169,12 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "tab_dock": "2. Molecular Docking (Vina)",
         "tab_probe": "3. Probe & Cavity Analysis",
         "tab_openmm": "4. Interventions (OpenMM)",
-        
-        "conv_desc": "Convert AF3 CIF to PDB and reconstruct sidechains using DLPacker",
+
+        "conv_desc": "Convert AF3 CIF to PDB and reconstruct sidechains using DLPacker; also batch-convert ligand SDF to PDB",
         "btn_cif2pdb": "▶ Batch CIF to PDB",
         "btn_dlp": "▶ Batch DLPacker Reconstruction",
-        
+        "btn_sdf2pdb": "▶ Batch SDF to PDB",
+
         "dock_data_frame": "Data Paths",
         "rec_lbl": "Receptor Folder:",
         "lig_lbl": "Ligand Parent Folder:",
@@ -178,27 +197,29 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "maxp_lbl": "Max Pockets:",
         "boxsz_lbl": "Box Size (Å):",
         "btn_run_dock": "▶ Start Docking",
-        
+
         "probe_desc": "Calculate cavity probe radius at true ligand center and compare structures",
         "btn_probe_compare": "▶ Compare All Probes (AF3 vs OpenMM vs DLP)",
         "btn_probe_survive": "▶ Analyze Survivor Cases",
-        
+
         "openmm_desc": "OpenMM sidechain repair, cryo-warming annealing, or guided ligand insertion",
         "btn_cold": "▶ Cryo-Warming (cold.py)",
         "btn_fit": "▶ Progressive Physical Pull (ligand_fit.py)",
         "btn_verify": "▶ 4-Layer Thermodynamic Verify (every case.py)",
-        
+
         "btn_stop": "⏹ Stop Current Task",
         "status_ready": "Ready",
         "log_frame": "Execution Log",
-        
+
         "msg_missing_deps": "⚠ Warning: Missing dependencies {}. Computational scripts may fail.\n  Run: pip install numpy gemmi",
         "msg_err_gemmi": "Missing gemmi library.\nRun: pip install gemmi",
-        "msg_err_pipeline": "Missing core Python dependencies.\nRun: pip install numpy pandas gemmi scikit-learn",
+        "msg_err_pipeline": "Missing dependencies or auto_pipeline loading failed!\nCheck terminal warnings.",
         "msg_err_vina": "Please specify a valid Vina path!",
         "msg_err_path": "Please select valid receptor or ligand folders",
         "msg_err_out": "Please select an output directory",
         "msg_err_manual": "Manual mode requires a valid .box file",
+        "msg_err_obabel": "Please configure the Obabel executable first!",
+        "msg_no_sdf": "No .sdf files found in the selected folder",
         "msg_save_err": "⚠ Config save failed: {}",
         "log_task_start": "▶ Start new task {}",
         "log_task_end": "✅ Task finished {}",
@@ -237,46 +258,70 @@ TRANSLATIONS: Dict[str, Dict[str, str]] = {
         "log_exec_err": "Execution error: {}",
         "log_dock_exc": "[{}/{}] {}   ❌ Exception: {}",
         "log_user_abort": "\n⏹ User aborted",
+        "log_sdf_start": "Found {} SDF files, converting to PDB...",
+        "log_sdf_total": "\n✅ SDF→PDB done: Success {} / Fail {} / Total {}",
     }
 }
 
-_ROOT = Path(__file__).resolve().parent
-CONFIG_FILE = _ROOT / "master_platform_config.json"
+CONFIG_FILE = _ROOT_DIR / "master_platform_config.json"
 
-for _sub in ("pipeline", "src", "analysis", _ROOT / "NEW"):
-    _p = str(_ROOT / _sub)
+# =====================================================================
+# 3. 强制路径加载与模块校验
+# =====================================================================
+_PIPELINE_DIR = str((_ROOT_DIR / "pipeline").resolve())
+if _PIPELINE_DIR not in sys.path:
+    sys.path.insert(0, _PIPELINE_DIR)
+
+for _sub in ("src", "analysis", str(_ROOT_DIR / "NEW")):
+    _p = str((_ROOT_DIR / _sub).resolve())
     if _p not in sys.path:
-        sys.path.insert(0, _p)
+        sys.path.append(_p)
 
 HAS_PIPELINE = False
 try:
     import auto_pipeline as ap
     import run_p2rank_rankfusion as prf
     import run_p2rank_baseline as prb
-    HAS_PIPELINE = True
-except ImportError as e:
-    print(f"Warning: Pipeline import failed ({e})")
 
-WORK_ROOT = _ROOT / "work"
+    if not hasattr(ap, "pdb_to_pdbqt_receptor"):
+        print("❌ 致命错误: auto_pipeline 里依然没有 pdb_to_pdbqt_receptor。")
+    else:
+        HAS_PIPELINE = True
+        print("✅ pipeline 模块加载校验通过。")
+except ImportError as e:
+    print(f"❌ 无法导入 pipeline 模块: {e}")
+
+WORK_ROOT = _ROOT_DIR / "work"
+
+# =====================================================================
+# 4. 重定向输出拦截器
+# =====================================================================
+class StdoutRedirect(io.StringIO):
+    def __init__(self, log_func):
+        super().__init__()
+        self.log_func = log_func
+    def write(self, msg):
+        if msg.strip():
+            self.log_func(msg.strip())
+        return super().write(msg)
+
 
 class AF3MasterApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.geometry("1100x920")
-        
-        # 状态变量
+
         self.config_data: Dict[str, Any] = self._load_config()
         self._stop_event = threading.Event()
         self.is_running = False
         self.current_lang: str = str(self.config_data.get("lang", "zh"))
-        
-        # 构建 UI
+
         self._build_ui()
+        self._update_preset_combo() 
         self._on_strategy_change()
 
     # ================= 语言与配置管理 =================
     def tr(self, key: str, *args: Any) -> str:
-        """获取当前语言的翻译文本，强制返回 str"""
         lang_dict = TRANSLATIONS.get(self.current_lang, TRANSLATIONS["zh"])
         text = lang_dict.get(key, key)
         if args:
@@ -295,12 +340,10 @@ class AF3MasterApp(tk.Tk):
         return {}
 
     def _get_str(self, key: str, default: str = "") -> str:
-        """安全读取字符串配置"""
         val = self.config_data.get(key)
         return str(val) if val is not None else default
 
     def _get_int(self, key: str, default: int) -> int:
-        """安全读取整数配置"""
         val = self.config_data.get(key)
         try:
             return int(val) if val is not None else default
@@ -308,7 +351,6 @@ class AF3MasterApp(tk.Tk):
             return default
 
     def _get_float(self, key: str, default: float) -> float:
-        """安全读取浮点数配置"""
         val = self.config_data.get(key)
         try:
             return float(val) if val is not None else default
@@ -338,24 +380,23 @@ class AF3MasterApp(tk.Tk):
         lang_map = {"中文": "zh", "English": "en"}
         self.current_lang = lang_map.get(self.lang_combo.get(), "zh")
         self.title(self.tr("app_title"))
-        
         self._update_widget_lang(self)
-        
+
         self.notebook.tab(0, text=self.tr("tab_convert"))
         self.notebook.tab(1, text=self.tr("tab_dock"))
         self.notebook.tab(2, text=self.tr("tab_probe"))
         self.notebook.tab(3, text=self.tr("tab_openmm"))
-        
+
         for key, rb in self.strategy_radios.items():
             rb.configure(text=self.tr(f"strat_{key}"))
-            
+
         self._update_preset_combo()
         self._save_config()
 
     def _update_widget_lang(self, widget):
         if hasattr(widget, "trans_key"):
             key = getattr(widget, "trans_key")
-            widget.configure(text=self.tr(key)) # type: ignore
+            widget.configure(text=self.tr(key)) 
         for child in widget.winfo_children():
             self._update_widget_lang(child)
 
@@ -368,7 +409,7 @@ class AF3MasterApp(tk.Tk):
         }
         self.preset_box.configure(values=[presets[k] for k in ("fast", "standard", "deep", "custom")])
         current_key = self.config_data.get("preset", "standard")
-        if not current_key in presets: 
+        if not current_key in presets:
             current_key = "standard"
         self.preset_var.set(presets[current_key])
 
@@ -376,11 +417,11 @@ class AF3MasterApp(tk.Tk):
     def _build_ui(self):
         top_bar = ttk.Frame(self)
         top_bar.pack(fill="x", padx=10, pady=5)
-        
+
         lbl_lang = ttk.Label(top_bar, text=self.tr("lang_lbl"))
         lbl_lang.trans_key = "lang_lbl"
         lbl_lang.pack(side="right")
-        
+
         self.lang_combo = ttk.Combobox(top_bar, values=["中文", "English"], width=8, state="readonly")
         self.lang_combo.set("中文" if self.current_lang == "zh" else "English")
         self.lang_combo.pack(side="right", padx=5)
@@ -401,14 +442,14 @@ class AF3MasterApp(tk.Tk):
         self._add_config_row(env_frame, 1, "obabel_lbl", self.obabel_var, "file")
         self._add_config_row(env_frame, 2, "meeko_lbl", self.meeko_var, "file")
         self._add_config_row(env_frame, 3, "p2rank_lbl", self.p2rank_var, "dir")
-        
+
         row4 = ttk.Frame(env_frame)
         row4.grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
         lbl = ttk.Label(row4, text=self.tr("wsl_lbl"))
         lbl.trans_key = "wsl_lbl"
         lbl.pack(side="left")
         ttk.Entry(row4, textvariable=self.wsl_env_var, width=20).pack(side="left", padx=5)
-        
+
         lbl2 = ttk.Label(row4, text=self.tr("root_lbl"))
         lbl2.trans_key = "root_lbl"
         lbl2.pack(side="left")
@@ -440,10 +481,10 @@ class AF3MasterApp(tk.Tk):
         self.btn_stop = ttk.Button(ctrl_frame, text=self.tr("btn_stop"), command=self._stop_tasks, state="disabled")
         self.btn_stop.trans_key = "btn_stop"
         self.btn_stop.pack(side="left")
-        
+
         self.pbar = ttk.Progressbar(ctrl_frame, length=400)
         self.pbar.pack(side="left", padx=20)
-        
+
         self.status_var = tk.StringVar(value=self.tr("status_ready"))
         lbl_status = ttk.Label(ctrl_frame, textvariable=self.status_var)
         lbl_status.pack(side="left")
@@ -453,7 +494,7 @@ class AF3MasterApp(tk.Tk):
         log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.log_txt = scrolledtext.ScrolledText(log_frame, height=15, font=("Consolas", 9), wrap="word", bg="#1e1e1e", fg="#d4d4d4", insertbackground="white")
         self.log_txt.pack(fill="both", expand=True)
-        
+
         if MISSING_DEPS:
             self.log(self.tr("msg_missing_deps", ", ".join(MISSING_DEPS)))
 
@@ -470,14 +511,18 @@ class AF3MasterApp(tk.Tk):
         lbl = ttk.Label(self.tab_convert, text=self.tr("conv_desc"))
         lbl.trans_key = "conv_desc"
         lbl.pack(anchor="w", pady=10)
-        
+
         btn1 = ttk.Button(self.tab_convert, text=self.tr("btn_cif2pdb"), command=self._task_cif_to_pdb)
         btn1.trans_key = "btn_cif2pdb"
         btn1.pack(anchor="w", pady=5)
-        
+
         btn2 = ttk.Button(self.tab_convert, text=self.tr("btn_dlp"), command=self._task_dlp_reconstruct)
         btn2.trans_key = "btn_dlp"
         btn2.pack(anchor="w", pady=5)
+
+        btn3 = ttk.Button(self.tab_convert, text=self.tr("btn_sdf2pdb"), command=self._task_sdf_to_pdb)
+        btn3.trans_key = "btn_sdf2pdb"
+        btn3.pack(anchor="w", pady=5)
 
     def _build_tab_dock(self):
         top = ttk.LabelFrame(self.tab_dock, text=self.tr("dock_data_frame"), padding=5)
@@ -500,7 +545,7 @@ class AF3MasterApp(tk.Tk):
         mid = ttk.LabelFrame(self.tab_dock, text=self.tr("dock_strategy_frame"), padding=5)
         mid.trans_key = "dock_strategy_frame"
         mid.pack(fill="x", pady=5)
-        
+
         self.strategy_var = tk.StringVar(value=self._get_str("strategy", "fpocket_rf"))
         self.strategy_radios = {}
         strategies = ["fpocket_rf", "p2rank_rf", "manual", "blind"]
@@ -529,13 +574,12 @@ class AF3MasterApp(tk.Tk):
         lbl = ttk.Label(cfg, text=self.tr("preset_lbl"))
         lbl.trans_key = "preset_lbl"
         lbl.grid(row=0, column=0, sticky="w")
-        
+
         self.preset_var = tk.StringVar(value=self._get_str("preset", "standard"))
         self.preset_box = ttk.Combobox(cfg, textvariable=self.preset_var, state="readonly", width=26)
         self.preset_box.grid(row=0, column=1, sticky="w", padx=6)
         self.preset_box.bind("<<ComboboxSelected>>", self._on_preset_change)
-        
-        # 使用安全读取
+
         self.exh_var = tk.IntVar(value=self._get_int("exh", 32))
         self.modes_var = tk.IntVar(value=self._get_int("modes", 20))
         self.lambda_var = tk.DoubleVar(value=self._get_float("lambda", 0.75))
@@ -565,11 +609,11 @@ class AF3MasterApp(tk.Tk):
         lbl = ttk.Label(self.tab_probe, text=self.tr("probe_desc"))
         lbl.trans_key = "probe_desc"
         lbl.pack(anchor="w", pady=10)
-        
+
         btn1 = ttk.Button(self.tab_probe, text=self.tr("btn_probe_compare"), command=lambda: self._task_run_external_script("compare_all_probes(2).py"))
         btn1.trans_key = "btn_probe_compare"
         btn1.pack(anchor="w", pady=5)
-        
+
         btn2 = ttk.Button(self.tab_probe, text=self.tr("btn_probe_survive"), command=lambda: self._task_run_external_script("analyze_survivors(1).py"))
         btn2.trans_key = "btn_probe_survive"
         btn2.pack(anchor="w", pady=5)
@@ -578,15 +622,15 @@ class AF3MasterApp(tk.Tk):
         lbl = ttk.Label(self.tab_openmm, text=self.tr("openmm_desc"))
         lbl.trans_key = "openmm_desc"
         lbl.pack(anchor="w", pady=10)
-        
+
         btn1 = ttk.Button(self.tab_openmm, text=self.tr("btn_cold"), command=lambda: self._task_run_external_script("cold.py"))
         btn1.trans_key = "btn_cold"
         btn1.pack(anchor="w", pady=5)
-        
+
         btn2 = ttk.Button(self.tab_openmm, text=self.tr("btn_fit"), command=lambda: self._task_run_external_script("ligand_fit.py"))
         btn2.trans_key = "btn_fit"
         btn2.pack(anchor="w", pady=5)
-        
+
         btn3 = ttk.Button(self.tab_openmm, text=self.tr("btn_verify"), command=lambda: self._task_run_external_script("every case.py"))
         btn3.trans_key = "btn_verify"
         btn3.pack(anchor="w", pady=5)
@@ -612,7 +656,7 @@ class AF3MasterApp(tk.Tk):
     def _resolve_p2rank(self) -> str:
         v = os.environ.get("P2RANK_DIR")
         if v and (Path(v) / "bin" / "p2rank.jar").is_file(): return v
-        cand = _ROOT / "tools" / "p2rank_2.6-alpha"
+        cand = _ROOT_DIR / "tools" / "p2rank_2.6-alpha"
         if (cand / "bin" / "p2rank.jar").is_file(): return str(cand)
         return ""
 
@@ -668,6 +712,28 @@ class AF3MasterApp(tk.Tk):
     def _stop_tasks(self):
         self._stop_event.set()
         self.log(self.tr("log_stop"))
+
+    def _inject_pipeline_config(self):
+        if not HAS_PIPELINE: return
+        if not hasattr(ap, "CFG") or not isinstance(getattr(ap, "CFG", None), dict):
+            try: setattr(ap, "CFG", {})
+            except Exception: pass
+        try:
+            ap.CFG.setdefault("blind_padding", 10.0)
+            ap.CFG.setdefault("blind_max_size", 40.0)
+        except Exception: pass
+
+        try:
+            vina_path = self.vina_var.get().strip()
+            obabel_path = self.obabel_var.get().strip()
+            meeko_path = self.meeko_var.get().strip()
+            if vina_path: setattr(ap, "VINA_BIN", vina_path)
+            if obabel_path: setattr(ap, "OBABEL_BIN", obabel_path)
+            if meeko_path: setattr(ap, "MEEKO_BIN", meeko_path)
+            if hasattr(ap, "CFG"):
+                ap.CFG["pg_wsl_env"] = self.wsl_env_var.get()
+        except Exception as e:
+            self.log(f"⚠ auto_pipeline 属性注入部分失败: {e}")
 
     # ================= 业务逻辑 =================
     def _task_cif_to_pdb(self):
@@ -731,6 +797,49 @@ class AF3MasterApp(tk.Tk):
             self._finish_task()
         threading.Thread(target=run, daemon=True).start()
 
+    def _task_sdf_to_pdb(self):
+        if self.is_running: return
+        obabel = self.obabel_var.get().strip()
+        if not obabel or not Path(obabel).is_file():
+            messagebox.showerror("Error", self.tr("msg_err_obabel"))
+            return
+        src_dir = filedialog.askdirectory(title="Select folder containing SDF files")
+        if not src_dir: return
+        src = Path(src_dir)
+        sdfs = sorted([p for p in src.iterdir() if p.is_file() and p.suffix.lower() == ".sdf"])
+        if not sdfs:
+            messagebox.showinfo("Info", self.tr("msg_no_sdf")); return
+        dst = src / "pdb_from_sdf"
+        dst.mkdir(parents=True, exist_ok=True)
+
+        def run():
+            self._start_task()
+            self.log(self.tr("log_sdf_start", len(sdfs)))
+            ok = fail = 0
+            for sdf in sdfs:
+                if self._stop_event.is_set():
+                    self.log(self.tr("log_user_abort")); break
+                out_pdb = dst / f"{sdf.stem}.pdb"
+                try:
+                    r = subprocess.run(
+                        [obabel, "-isdf", str(sdf), "-opdb", "-O", str(out_pdb)],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace"
+                    )
+                    if out_pdb.is_file() and out_pdb.stat().st_size > 0:
+                        ok += 1
+                        self.log(self.tr("log_conv_success", sdf.stem))
+                    else:
+                        fail += 1
+                        err = (r.stderr or r.stdout or "").strip()[:200]
+                        self.log(self.tr("log_conv_fail", sdf.stem, err or "no output"))
+                except Exception as e:
+                    fail += 1
+                    self.log(self.tr("log_conv_fail", sdf.stem, str(e)))
+            self.log(self.tr("log_sdf_total", ok, fail, len(sdfs)))
+            self._finish_task()
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _start_docking(self):
         if self.is_running: return
         if not HAS_PIPELINE:
@@ -749,11 +858,8 @@ class AF3MasterApp(tk.Tk):
         if strategy == "manual" and not Path(self.manual_box_var.get()).is_file():
             messagebox.showerror("Error", self.tr("msg_err_manual")); return
 
-        ap.VINA_BIN = vina_path
-        ap.OBABEL_BIN = obabel_path
-        if self.meeko_var.get(): ap.MEEKO_BIN = self.meeko_var.get()
-        ap.CFG["pg_wsl_env"] = self.wsl_env_var.get()
-        
+        self._inject_pipeline_config()
+
         p2rank_dir = self.p2rank_var.get().strip()
         if p2rank_dir and (Path(p2rank_dir) / "bin" / "p2rank.jar").is_file():
             prb.P2RANK_DIR = Path(p2rank_dir)
@@ -761,9 +867,9 @@ class AF3MasterApp(tk.Tk):
             prb.P2RANK_DIR = None
 
         cfg = {
-            "exh": self._get_int("exh", 32), 
+            "exh": self._get_int("exh", 32),
             "modes": self._get_int("modes", 20),
-            "lambda": self._get_float("lambda", 0.75), 
+            "lambda": self._get_float("lambda", 0.75),
             "max_pockets": self._get_int("max_pockets", 20),
             "box_size": self._get_float("box_size", 25.0),
             "manual_box": self.manual_box_var.get() if strategy == "manual" else None,
@@ -800,12 +906,25 @@ class AF3MasterApp(tk.Tk):
         case_out = out_root / case
         case_out.mkdir(parents=True, exist_ok=True)
         self.log(self.tr("log_case_start", case, receptor_pdb.name))
-        
+
+        if not hasattr(ap, "CFG") or not isinstance(getattr(ap, "CFG", None), dict):
+            try: setattr(ap, "CFG", {})
+            except Exception: pass
+        if hasattr(ap, "CFG"):
+            ap.CFG.setdefault("blind_padding", 10.0)
+            ap.CFG.setdefault("blind_max_size", 40.0)
+
         rec_pdbqt = case_out / "receptor.pdbqt"
         if not rec_pdbqt.is_file() or rec_pdbqt.stat().st_size < 100:
             self.log(self.tr("log_rec_conv", case))
-            if not ap.pdb_to_pdbqt_receptor(str(receptor_pdb), str(rec_pdbqt)):
-                self.log(self.tr("log_rec_fail", case)); return False
+            if not hasattr(ap, "pdb_to_pdbqt_receptor"):
+                self.log(f"❌ 核心函数缺失！当前 auto_pipeline 路径: {ap.__file__}")
+                return False
+            
+            # 拦截底层转换时的输出
+            with contextlib.redirect_stdout(StdoutRedirect(lambda m: self.log(f"[{case}]   {m}"))):
+                if not ap.pdb_to_pdbqt_receptor(str(receptor_pdb), str(rec_pdbqt)):
+                    self.log(self.tr("log_rec_fail", case)); return False
 
         ligs = sorted([p for p in ligand_dir.iterdir() if p.suffix.lower() in (".pdb", ".sdf", ".mol", ".mol2", ".pdbqt") and p.is_file()])
         if not ligs:
@@ -832,14 +951,14 @@ class AF3MasterApp(tk.Tk):
                 self.log(self.tr("log_bbox_fail", case)); return False
             final_center, final_size = center, size
             with open(box_file, "w") as f:
-                f.write(f"{center[0]:.3f} {center[1]:.3f} {center[2]:.3f} {size[0]:.3f} {size[1]:.3f} {size[2]:.3f}\n")
+                f.write(f"{final_center[0]:.3f} {final_center[1]:.3f} {final_center[2]:.3f} {final_size[0]:.3f} {final_size[1]:.3f} {final_size[2]:.3f}\n")
 
         elif strategy == "manual":
             manual_src = cfg.get("manual_box")
             if not manual_src or not Path(manual_src).is_file():
                 self.log(self.tr("msg_err_manual"))
                 return False
-            with open(str(manual_src)) as f: 
+            with open(str(manual_src)) as f:
                 parts = f.read().split()
             final_center = tuple(map(float, parts[:3]))
             final_size = tuple(map(float, parts[3:6]))
@@ -855,10 +974,20 @@ class AF3MasterApp(tk.Tk):
             ap.CFG["pg_quick_modes"] = 3
             ap.CFG["pg_max_pockets"] = cfg.get("max_pockets", 20)
             ap.CFG["pg_box_size"] = cfg.get("box_size", 25.0)
+            
             try:
-                ok, _ = ap.run_pocket_guided(str(receptor_pdb), str(ligand_dir), str(case_out))
+                # 拦截 auto_pipeline 里所有的 print 报错，如 wsl 找不到环境
+                with contextlib.redirect_stdout(StdoutRedirect(lambda m: self.log(f"[{case}]   {m}"))):
+                    ok, _ = ap.run_pocket_guided(str(receptor_pdb), str(ligand_dir), str(case_out))
             except Exception as e:
                 self.log(self.tr("log_fpocket_err", case, str(e))); return False
+                
+            # 【核心修复】：auto_pipeline 把 box 写在了 receptor_pdb (大分子) 的同级目录
+            expected_ap_box = receptor_pdb.parent / f"{receptor_pdb.stem}.box"
+            if expected_ap_box.is_file():
+                # 将其复制到 GUI 期望的 case_out/receptor.box
+                shutil.copy2(expected_ap_box, box_file)
+                
             if not ok or not box_file.is_file():
                 self.log(self.tr("log_fpocket_nobox", case)); return False
             with open(box_file) as f: parts = f.read().split()
@@ -870,6 +999,10 @@ class AF3MasterApp(tk.Tk):
             ok, center, size = self._run_p2rank_guided(receptor_pdb, ligand_dir, case_out, cfg)
             if not ok: return False
             final_center, final_size = center, size
+
+        if final_center is None or final_size is None:
+            self.log(f"❌ {case} 盒子生成失败！")
+            return False
 
         self.log(self.tr("log_fine_dock", case, cfg['exh'], cfg['modes']))
         fine_dir = case_out / "docking_results"
@@ -943,17 +1076,26 @@ class AF3MasterApp(tk.Tk):
         if self.is_running: return
         def run():
             self._start_task()
-            script = _ROOT / "NEW" / script_name
+            script = _ROOT_DIR / "NEW" / script_name
             if not script.is_file():
                 self.log(self.tr("log_no_script", str(script)))
                 self._finish_task(); return
+                
             env = os.environ.copy()
             env["VINA_BIN"] = self.vina_var.get()
             env["OBABEL_BIN"] = self.obabel_var.get()
+            env["MEEKO_BIN"] = self.meeko_var.get()
+            
+            # 【核心修复 1】：把 GUI 当前加载的所有模块路径 (sys.path) 传给子进程
+            env["PYTHONPATH"] = os.pathsep.join(sys.path)
+            
             try:
+                # 【核心修复 2】：加入 cwd，强制子进程在项目根目录下运行，防止相对路径读取失败
                 process = subprocess.Popen(
-                    [sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, encoding="utf-8", errors="replace", env=env
+                    [sys.executable or "python", str(script)], 
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", env=env,
+                    cwd=str(_ROOT_DIR)
                 )
                 if process.stdout:
                     for line in process.stdout:
